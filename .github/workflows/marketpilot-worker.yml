@@ -1,0 +1,47 @@
+name: MarketPilot worker (paper trading)
+
+# Runs the bots on GitHub's servers, so trading continues whether or not the
+# Streamlit app is open on your iPhone. GitHub cron can start a few minutes late;
+# that's fine for hourly/daily bars (orders filled >2 bars late are cancelled).
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # every hour at :07 UTC  -> trading cycle
+    - cron: "23 5 * * 6"     # Saturdays 05:23 UTC    -> strategy research
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "run-once | research | report | kill | resume"
+        default: run-once
+
+concurrency:
+  group: marketpilot-worker   # never two cycles at once (prevents duplicate orders)
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MARKETPILOT_DB: supabase
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Choose command
+        id: cmd
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "c=${{ github.event.inputs.command }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "23 5 * * 6" ]; then
+            echo "c=research" >> "$GITHUB_OUTPUT"
+          else
+            echo "c=run-once" >> "$GITHUB_OUTPUT"
+          fi
+      - run: python -m marketpilot ${{ steps.cmd.outputs.c }}
