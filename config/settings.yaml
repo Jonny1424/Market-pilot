@@ -1,0 +1,72 @@
+# MarketPilot v0.4 settings — PAPER TRADING ONLY.
+# Live-money execution is deliberately not implemented.
+
+account:
+  currency: GBP
+  starting_balance: 500.0
+  risk_per_trade_pct: 0.5        # 0.5% of equity = £2.50 on £500
+  daily_loss_limit_pct: 2.0      # pause new trades for the day after -2%
+  max_open_positions: 4
+  max_leverage: 1.0              # 1.0 = no leverage (total notional <= equity)
+  max_cost_fraction_of_risk: 0.35  # reject trades where costs eat >35% of 1R
+
+# Universe. Symbols use Yahoo Finance tickers (free, unofficial data).
+# interval: 1d for stocks/ETFs, 1h for crypto and forex.
+universe:
+  stocks:
+    interval: 1d
+    lookback_days: 3650
+    symbols: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, XOM]
+  crypto:
+    interval: 1h
+    lookback_days: 720
+    symbols: [BTC-USD, ETH-USD, SOL-USD]
+  forex:
+    interval: 1h
+    lookback_days: 720
+    symbols: [EURUSD=X, GBPUSD=X, USDJPY=X, EURGBP=X]
+
+# Transaction cost model per asset class (applied in backtests AND paper fills).
+# bps = basis points (1 bp = 0.01%). Commission is per side.
+costs:
+  stocks: {spread_bps: 2.0, slippage_bps: 3.0, commission_pct: 0.0, commission_fixed: 0.0}
+  crypto: {spread_bps: 10.0, slippage_bps: 10.0, commission_pct: 0.10, commission_fixed: 0.0}
+  forex:  {spread_bps: 1.5, slippage_bps: 1.0, commission_pct: 0.0, commission_fixed: 0.0}
+
+# Strategy approval gate (Backtesting Bot). A strategy must pass ALL of these
+# on out-of-sample (walk-forward) data AND on a final untouched holdout.
+approval:
+  min_oos_trades: 30
+  min_oos_expectancy_r: 0.05
+  min_oos_profit_factor: 1.15
+  min_holdout_trades: 8
+  min_holdout_expectancy_r: 0.0
+  holdout_fraction: 0.2
+  walk_forward_folds: 4
+
+# Live (forward paper) review: retire strategies that underperform.
+retirement:
+  min_live_trades: 30
+  retire_if_expectancy_below_r: 0.0
+
+# Trade Decision Bot: minimum estimated edge after shrinkage.
+decision:
+  min_expected_r: 0.05
+  shrinkage_trades: 30           # EV is shrunk toward 0 by n/(n+30)
+
+# Win-rate goal shown on the dashboard. Win rate is tracked but strategies are
+# NOT optimised on it alone (that rewards tiny targets + wide stops).
+goals:
+  target_win_rate: 0.70
+
+news:
+  calendar_file: config/events.yaml
+  use_earnings_blackout: true
+  earnings_blackout_days: 1
+  llm_enabled: false             # needs ANTHROPIC_API_KEY; veto-only, never a buy signal
+  llm_model: claude-haiku-5-5
+
+safety:
+  max_consecutive_feed_failures: 3
+  stale_multiplier: 3.0          # data is stale if last bar older than 3x interval (market-hours aware)
+  max_daily_trades: 20
