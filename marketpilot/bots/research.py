@@ -18,6 +18,7 @@ from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
 from ..strategies import ALL_STRATEGIES, SHORTABLE
+from .learning import forward_stats, forward_verdict
 
 
 def research(settings, provider, store, now: datetime, symbols: list[str] | None = None,
@@ -30,6 +31,8 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
         if old["symbol"] not in universe:
             store.save_strategy({**old, "status": "removed", "reasons": ["symbol no longer in universe"]})
     filters = settings.raw.get("market_filter") or {}
+    learn_cfg = settings.raw.get("learning")
+    fstats = forward_stats(store) if learn_cfg else None
     rows_out = []
     for cls_name, spec in settings["universe"].items():
         data = {}
@@ -73,6 +76,12 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 costs += [t.cost_r for t in r["oos_trades"]]
             pooled = {"oos": summarize(oos_r), "holdout": summarize(hold_r)}
             ok, reasons = passes_gate(pooled, gate)
+            if learn_cfg:  # forward (shadow) evidence can promote or demote
+                verdict, why = forward_verdict(fstats, cls_name, strat.name, learn_cfg)
+                if verdict == "promote" and not ok and pooled["oos"]["expectancy_r"] > 0:
+                    ok, reasons = True, [why]
+                elif verdict == "demote" and ok:
+                    ok, reasons = False, [why]
             o = pooled["oos"]
             log(f"research: {cls_name:<7} {strat.name:<20} {'APPROVED' if ok else 'rejected':<9} "
                 f"OOS n={o['trades']:<4} win {o['win_rate']:.0%} exp {o['expectancy_r']:+.3f}R "
