@@ -1,5 +1,14 @@
 """Strategy rules. The same `signal()` is used by the backtester and by live
-paper trading, so what was tested is exactly what trades."""
+paper trading, so what was tested is exactly what trades.
+
+v0.5 changes (see docs/RESEARCH.md):
+  * new TrendSMA200 — the 200-day / 12-month trend rule (Faber 2007; Moskowitz,
+    Ooi & Pedersen 2012; Hurst, Ooi & Pedersen 2017)
+  * MeanReversion now follows Connors' published rules: buy RSI(2) dips below the
+    5-day average in an uptrend, EXIT on a close back above the 5-day average
+  * trend/breakout strategies can use a chandelier trailing stop instead of a
+    fixed target — offered as variants, and walk-forward testing picks
+"""
 from __future__ import annotations
 
 import itertools
@@ -7,14 +16,20 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+NO_TARGET = 99.0   # target this many ATRs away = effectively no fixed target
+
 
 @dataclass(frozen=True)
 class Signal:
-    direction: int          # +1 long, -1 short
-    stop_atr: float         # stop distance in ATR multiples
-    target_atr: float       # target distance in ATR multiples
-    max_hold: int           # bars
+    direction: int            # +1 long, -1 short
+    stop_atr: float           # initial stop distance in ATR multiples
+    target_atr: float         # target distance in ATR multiples (NO_TARGET = none)
+    max_hold: int             # bars
     note: str = ""
+    trail_atr: float = 0.0    # >0: chandelier trailing stop, ATRs behind best close
+    exit_ma: int = 0          # >0: close-based exit vs SMA(exit_ma)
+    exit_on: str = ""         # "revert": exit when close crosses MA in our favour
+                              # "break":  exit when close crosses MA against us
 
 
 class Strategy:
@@ -25,7 +40,7 @@ class Strategy:
 
     def __init__(self, **params):
         defaults = {k: v[0] for k, v in self.grid.items()}
-        defaults.update(params)
+        defaults.update({k: v for k, v in params.items() if k in self.grid})
         self.params = {k: float(v) for k, v in defaults.items()}
 
     @property
@@ -35,26 +50,34 @@ class Strategy:
     @classmethod
     def variants(cls) -> list["Strategy"]:
         keys = list(cls.grid)
-        return [cls(**dict(zip(keys, combo))) for combo in itertools.product(*cls.grid.values())]
+        out = [cls(**dict(zip(keys, combo))) for combo in itertools.product(*cls.grid.values())]
+        # a fixed-target strategy with no target and no trail would never exit early
+        return [v for v in out if not (v.params.get("target", 0) >= NO_TARGET and v.params.get("trail", 1) == 0)]
 
-    def signal(self, prev: pd.Series, row: pd.Series) -> Signal | None:
+    def signal(self, prev, row) -> Signal | None:
         raise NotImplementedError
 
 
+def _na(*vals) -> bool:
+    return any(v is None or pd.isna(v) for v in vals)
+
+
 class TrendFollowing(Strategy):
-    """EMA 20/50 crossover, only when price action is efficient (trending)."""
+    """EMA 20/50 crossover."""
     name, family = "trend_ema", "trend-following"
     regimes = frozenset({"trending", "volatile", "ranging"})
-    grid = {"stop": [2.0, 3.0], "target": [4.0, 6.0], "er_min": [0.0, 0.25]}
+    grid = {"stop": [2.0, 3.0], "target": [5.0, NO_TARGET], "trail": [0.0, 3.0]}
 
     def signal(self, prev, row):
-        if pd.isna(row["ema50"]) or pd.isna(row["er20"]) or row["er20"] < self.params["er_min"]:
+        if _na(row["ema50"], prev["ema50"], row["atr14"]):
             return None
         p = self.params
+        if p["target"] >= NO_TARGET and p["trail"] == 0:
+            return None  # no target and no trail = no exit other than time: skip variant
         if prev["ema20"] <= prev["ema50"] and row["ema20"] > row["ema50"]:
-            return Signal(1, p["stop"], p["target"], 60, "EMA20 crossed above EMA50")
+            return Signal(1, p["stop"], p["target"], 60, "EMA20 crossed above EMA50", trail_atr=p["trail"])
         if prev["ema20"] >= prev["ema50"] and row["ema20"] < row["ema50"]:
-            return Signal(-1, p["stop"], p["target"], 60, "EMA20 crossed below EMA50")
+            return Signal(-1, p["stop"], p["target"], 60, "EMA20 crossed below EMA50", trail_atr=p["trail"])
         return None
 
 
@@ -62,34 +85,39 @@ class Breakout(Strategy):
     """20-bar Donchian channel breakout."""
     name, family = "breakout_donchian", "breakout"
     regimes = frozenset({"trending", "volatile"})
-    grid = {"stop": [1.5, 2.5], "target": [3.0, 5.0]}
+    grid = {"stop": [1.5, 2.5], "target": [4.0, NO_TARGET], "trail": [0.0, 3.0]}
 
     def signal(self, prev, row):
-        if pd.isna(row["dc_high"]) or pd.isna(row["atr14"]):
+        if _na(row["dc_high"], prev["dc_high"], row["atr14"]):
             return None
         p = self.params
+        if p["target"] >= NO_TARGET and p["trail"] == 0:
+            return None
         if row["close"] > row["dc_high"] and prev["close"] <= prev["dc_high"]:
-            return Signal(1, p["stop"], p["target"], 40, "close broke 20-bar high")
+            return Signal(1, p["stop"], p["target"], 40, "close broke 20-bar high", trail_atr=p["trail"])
         if row["close"] < row["dc_low"] and prev["close"] >= prev["dc_low"]:
-            return Signal(-1, p["stop"], p["target"], 40, "close broke 20-bar low")
+            return Signal(-1, p["stop"], p["target"], 40, "close broke 20-bar low", trail_atr=p["trail"])
         return None
 
 
 class MeanReversion(Strategy):
-    """RSI(2) pullback in the direction of the 200-bar trend.
-    Naturally high win rate (small target, wider stop) — watch expectancy."""
+    """Connors RSI(2): in a long-term uptrend (close > SMA200), buy when RSI(2) is
+    oversold and price is below its 5-day average; exit on a close back above the
+    5-day average, after 10 bars, or at a wide protective stop."""
     name, family = "mean_reversion_rsi2", "mean-reversion"
-    regimes = frozenset({"ranging", "trending"})
-    grid = {"stop": [2.5, 3.5], "target": [1.0, 1.5], "rsi_lo": [10]}
+    regimes = frozenset({"ranging", "trending", "volatile"})
+    grid = {"rsi_lo": [5.0, 10.0], "stop": [3.0, 4.0]}
 
     def signal(self, prev, row):
-        if pd.isna(row["sma200"]):
+        if _na(row["sma200"], row["sma5"], row["atr14"]):
             return None
         p = self.params
-        if row["close"] > row["sma200"] and row["rsi2"] < p["rsi_lo"]:
-            return Signal(1, p["stop"], p["target"], 10, f"RSI2 {row['rsi2']:.0f} above SMA200")
-        if row["close"] < row["sma200"] and row["rsi2"] > 100 - p["rsi_lo"]:
-            return Signal(-1, p["stop"], p["target"], 10, f"RSI2 {row['rsi2']:.0f} below SMA200")
+        if row["close"] > row["sma200"] and row["close"] < row["sma5"] and row["rsi2"] < p["rsi_lo"]:
+            return Signal(1, p["stop"], NO_TARGET, 10, f"RSI2 {row['rsi2']:.0f} dip in uptrend",
+                          exit_ma=5, exit_on="revert")
+        if row["close"] < row["sma200"] and row["close"] > row["sma5"] and row["rsi2"] > 100 - p["rsi_lo"]:
+            return Signal(-1, p["stop"], NO_TARGET, 10, f"RSI2 {row['rsi2']:.0f} pop in downtrend",
+                          exit_ma=5, exit_on="revert")
         return None
 
 
@@ -101,7 +129,7 @@ class MomentumPullback(Strategy):
     grid = {"stop": [2.0, 3.0], "target": [3.0, 4.5], "rsi": [45]}
 
     def signal(self, prev, row):
-        if pd.isna(row["ema50"]) or pd.isna(row["roc20"]):
+        if _na(row["ema50"], row["roc20"], prev["rsi14"]):
             return None
         p, lvl = self.params, self.params["rsi"]
         if row["ema20"] > row["ema50"] and row["roc20"] > 0 and prev["rsi14"] < lvl <= row["rsi14"]:
@@ -111,7 +139,28 @@ class MomentumPullback(Strategy):
         return None
 
 
-ALL_STRATEGIES: list[type[Strategy]] = [TrendFollowing, Breakout, MeanReversion, MomentumPullback]
+class TrendSMA200(Strategy):
+    """Long-term trend (time-series momentum): enter when price closes above its
+    200-day average AND the 12-month return is positive; exit on a close back
+    below the 200-day average (or a wide protective / trailing stop)."""
+    name, family = "trend_sma200", "time-series momentum"
+    regimes = frozenset({"trending", "ranging", "volatile"})
+    grid = {"stop": [3.0, 5.0], "trail": [0.0, 4.0]}
+
+    def signal(self, prev, row):
+        if _na(row["sma200"], prev["sma200"], row["roc252"], row["atr14"]):
+            return None
+        p = self.params
+        if prev["close"] <= prev["sma200"] and row["close"] > row["sma200"] and row["roc252"] > 0:
+            return Signal(1, p["stop"], NO_TARGET, 250, "closed above 200-day avg, 12m return > 0",
+                          trail_atr=p["trail"], exit_ma=200, exit_on="break")
+        if prev["close"] >= prev["sma200"] and row["close"] < row["sma200"] and row["roc252"] < 0:
+            return Signal(-1, p["stop"], NO_TARGET, 250, "closed below 200-day avg, 12m return < 0",
+                          trail_atr=p["trail"], exit_ma=200, exit_on="break")
+        return None
+
+
+ALL_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback]
 
 
 def strategy_from_key(key: str) -> Strategy:
@@ -124,6 +173,6 @@ def strategy_from_key(key: str) -> Strategy:
     return cls(**params)
 
 
-# Asset classes where shorting is allowed in the simulation (spot stocks/crypto
+# Asset classes where shorting is allowed in the simulation (spot ETFs/crypto
 # with no leverage are long-only; forex pairs are naturally two-way).
 SHORTABLE = {"forex"}

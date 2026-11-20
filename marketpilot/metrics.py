@@ -23,7 +23,8 @@ def summarize(r_multiples: Iterable[float]) -> dict:
     if n == 0:
         return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "win_rate_lo": 0.0,
                 "win_rate_hi": 1.0, "avg_win_r": 0.0, "avg_loss_r": 0.0, "win_loss_ratio": 0.0,
-                "expectancy_r": 0.0, "profit_factor": 0.0, "total_r": 0.0, "max_drawdown_r": 0.0}
+                "expectancy_r": 0.0, "profit_factor": 0.0, "total_r": 0.0, "max_drawdown_r": 0.0,
+                "t_stat": 0.0}
     wins, losses = r[r > 0], r[r <= 0]
     lo, hi = wilson_interval(len(wins), n)
     gross_win, gross_loss = wins.sum(), -losses.sum()
@@ -43,4 +44,6 @@ def summarize(r_multiples: Iterable[float]) -> dict:
         "profit_factor": float(gross_win / gross_loss) if gross_loss > 0 else float("inf"),
         "total_r": float(r.sum()),
         "max_drawdown_r": float(dd.max()) if n else 0.0,
+        # t-statistic of mean R: how many standard errors the average is above zero
+        "t_stat": float(r.mean() / (r.std(ddof=1) / np.sqrt(n))) if n > 1 and r.std(ddof=1) > 0 else 0.0,
     }

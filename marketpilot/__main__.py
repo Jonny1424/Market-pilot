@@ -5,6 +5,7 @@
   python -m marketpilot loop --minutes 60   # keep cycling (for a VPS / always-on box)
   python -m marketpilot report              # print win rate & performance
   python -m marketpilot kill | resume       # system-wide kill switch
+  python -m marketpilot notify-test         # send a test push notification (needs NTFY_TOPIC)
   python -m marketpilot demo --days 30      # offline end-to-end demo on synthetic data
 
 Storage: --db supabase   (env SUPABASE_URL + SUPABASE_SERVICE_KEY)
@@ -23,7 +24,7 @@ from .storage import make_store
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="marketpilot")
-    ap.add_argument("command", choices=["research", "run-once", "loop", "report", "kill", "resume", "demo"])
+    ap.add_argument("command", choices=["research", "run-once", "loop", "report", "kill", "resume", "demo", "notify-test"])
     ap.add_argument("--db", default=None)
     ap.add_argument("--provider", default="yfinance", help="yfinance | synthetic | ccxt:kraken")
     ap.add_argument("--symbols", nargs="*")
@@ -36,6 +37,14 @@ def main(argv=None) -> int:
     store = make_store(args.db)
     now = datetime.now(timezone.utc)
 
+    if args.command == "notify-test":
+        from . import notify
+        from .bots.performance import report
+        ok = notify.send("MarketPilot is connected", "Test notification: your phone will get trade alerts "
+                         "and a daily summary from the paper-trading bots.", tags="tada")
+        rep = report(store.trades(), settings.account["starting_balance"])["overall"]
+        print("sent" if ok else "NOT sent - is NTFY_TOPIC set?", rep["trades"], "closed trades so far")
+        return 0 if ok else 1
     if args.command == "kill":
         from .bots.safety import SafetyBot
         SafetyBot(store, settings).engage("manual kill switch from CLI")

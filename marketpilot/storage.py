@@ -27,7 +27,8 @@ TABLES = {
         bars_held INTEGER, risk_gbp REAL, risk_per_unit REAL, fx_to_gbp REAL, notional_gbp REAL,
         closed_at TEXT, exit_price REAL, exit_reason TEXT, pnl_gbp REAL, fees_gbp REAL,
         r_multiple REAL, last_bar_time TEXT, signal_bar_time TEXT, atr REAL,
-        stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT""",
+        stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT, trail_atr REAL,
+        exit_ma INTEGER, exit_on TEXT, best_price REAL""",
     "mp_strategies": """
         strategy_id TEXT PRIMARY KEY, symbol TEXT, asset_class TEXT, strategy TEXT,
         family TEXT, params TEXT, status TEXT, reasons TEXT, oos TEXT, holdout TEXT,
