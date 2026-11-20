@@ -15,7 +15,8 @@ from pathlib import Path
 
 import yaml
 
-ETFS = {"SPY", "QQQ", "IWM", "DIA", "VUAG.L", "VOO", "VTI"}
+ETFS = {"SPY", "QQQ", "IWM", "DIA", "VUAG.L", "VOO", "VTI", "EFA", "EEM", "XLK", "XLF", "XLE", "XLV",
+        "XLY", "XLP", "XLI", "XLU", "XLB", "TLT", "IEF", "GLD", "SLV", "VNQ"}
 
 
 def symbol_tags(symbol: str, asset_class: str) -> set[str]:
