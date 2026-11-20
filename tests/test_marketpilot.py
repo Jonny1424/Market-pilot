@@ -356,3 +356,37 @@ def test_removed_symbol_position_still_managed(small_settings, store):
     for k in range(13, 0, -1):
         eng.cycle(df.index[-k].to_pydatetime() + timedelta(days=1, minutes=7))
     assert store.trades()[0]["status"] == "closed"   # max hold 10 bars at most
+
+
+# ---------------- v0.6 ----------------
+
+def test_quote_currencies():
+    from marketpilot.data import quote_currency
+    assert quote_currency("USDCAD=X", "forex") == "CAD"
+    assert quote_currency("EURCHF=X", "forex") == "CHF"
+    assert quote_currency("ISF.L", "international") == "GBp"
+    assert quote_currency("EWJ", "international") == "USD"
+    assert quote_currency("LINK-USD", "crypto") == "USD"
+
+
+def test_fx_conversion_is_generic_and_never_silently_one():
+    from marketpilot.data import DataProvider
+
+    class Fake(DataProvider):
+        def history(self, symbol, interval, start, end):
+            rates = {"GBPCAD=X": 1.80, "GBPUSD=X": 1.25, "GBPJPY=X": 190.0}
+            return pd.DataFrame({"close": [rates[symbol]]})
+    p, now = Fake(), datetime(2026, 11, 20, tzinfo=UTC)
+    assert p.fx_to_gbp("CAD", now) == pytest.approx(1 / 1.80)
+    assert p.fx_to_gbp("USD", now) == pytest.approx(0.8)
+    assert p.fx_to_gbp("GBp", now) == 0.01
+    with pytest.raises(RuntimeError):
+        p.fx_to_gbp("XYZ", now)
+
+
+def test_every_market_group_has_costs_and_valid_filter(settings):
+    for cls in settings["universe"]:
+        assert cls in settings["costs"]
+    for cls, spec in settings.raw["market_filter"].items():
+        assert spec["symbol"] in settings.all_symbols()
+    assert len(settings.all_symbols()) == len(set(settings.all_symbols()))
