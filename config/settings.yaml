@@ -6,43 +6,58 @@ account:
   starting_balance: 500.0
   risk_per_trade_pct: 0.5        # 0.5% of equity = £2.50 on £500
   daily_loss_limit_pct: 2.0      # pause new trades for the day after -2%
-  max_open_positions: 4
+  max_open_positions: 8          # v0.6: more markets -> room for 8 positions (8 x 0.5% = 4% total risk)
   max_leverage: 1.0              # 1.0 = no leverage (total notional <= equity)
   max_cost_fraction_of_risk: 0.35  # reject trades where costs eat >35% of 1R
 
-# Universe (v0.5). Symbols use Yahoo Finance tickers (free, unofficial data).
-# v0.5: broad ETFs instead of 10 hand-picked winners (removes hindsight /
-# survivorship bias); crypto and forex moved from 1h to daily bars, where the
-# research evidence for trend effects is (see docs/RESEARCH.md).
+# Universe (v0.6): six market groups ("market bots"), each researched and approved
+# separately. Symbols use Yahoo Finance tickers (free, unofficial data).
+# Broad, long-lived ETFs rather than hand-picked companies (avoids hindsight bias).
 universe:
-  stocks:            # US index, sector, international, bond, gold & property ETFs
+  stocks:            # US equity: index, size and sector ETFs
     interval: 1d
     lookback_days: 7300
-    symbols: [SPY, QQQ, IWM, DIA, EFA, EEM, XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLU, XLB,
-              TLT, IEF, GLD, SLV, VNQ]
-  crypto:
+    symbols: [SPY, QQQ, IWM, DIA, MDY, XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLU, XLB, XLC, XLRE, VNQ]
+  international:     # developed & emerging country ETFs, incl. UK FTSE 100 (priced in pence)
+    interval: 1d
+    lookback_days: 7300
+    symbols: [EFA, EEM, EWJ, EWG, EWU, EWC, EWA, EWZ, EWY, FXI, INDA, ISF.L]
+  bonds:             # government, inflation-linked, corporate & emerging-market debt
+    interval: 1d
+    lookback_days: 7300
+    symbols: [TLT, IEF, SHY, TIP, LQD, HYG, EMB, AGG]
+  commodities:       # precious & industrial metals, energy, agriculture, broad basket
+    interval: 1d
+    lookback_days: 7300
+    symbols: [GLD, SLV, CPER, USO, UNG, DBA, DBC]
+  crypto:            # large-cap coins only (momentum evidence is concentrated there)
     interval: 1d
     lookback_days: 3650
-    symbols: [BTC-USD, ETH-USD, SOL-USD]
-  forex:
+    symbols: [BTC-USD, ETH-USD, SOL-USD, XRP-USD, BNB-USD, ADA-USD, DOGE-USD, LTC-USD, LINK-USD, AVAX-USD]
+  forex:             # majors and yen/franc crosses
     interval: 1d
     lookback_days: 7300
-    symbols: [EURUSD=X, GBPUSD=X, USDJPY=X, EURGBP=X, AUDUSD=X, USDCAD=X]
+    symbols: [EURUSD=X, GBPUSD=X, USDJPY=X, EURGBP=X, AUDUSD=X, USDCAD=X, NZDUSD=X, USDCHF=X,
+              EURJPY=X, GBPJPY=X, AUDJPY=X, EURCHF=X]
 
-# Market trend filter (Faber 2007): no new LONG trades in a class while its
-# benchmark closes below its 200-day average. Bonds/gold are excluded because
-# they often rise when stocks fall.
+# Market trend filter (Faber 2007): no new LONG trades in a group while its
+# benchmark closes below its 200-day average. Bonds and commodities have no
+# filter because they often rise when stocks fall.
 market_filter:
-  stocks: {symbol: SPY, exclude: [TLT, IEF, GLD, SLV]}
+  stocks: {symbol: SPY}
+  international: {symbol: EFA}
   crypto: {symbol: BTC-USD}
 
 # Transaction cost model per asset class (applied in backtests AND paper fills).
 # bps = basis points (1 bp = 0.01%). Commission is per side.
 costs:
   stocks: {spread_bps: 2.0, slippage_bps: 3.0, commission_pct: 0.0, commission_fixed: 0.0}
+  international: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0}
+  bonds:  {spread_bps: 2.0, slippage_bps: 2.0, commission_pct: 0.0, commission_fixed: 0.0}
+  commodities: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0}
   # crypto: entry-tier taker fee on Kraken Pro is 0.40%, Coinbase Advanced 0.60%
   crypto: {spread_bps: 10.0, slippage_bps: 10.0, commission_pct: 0.40, commission_fixed: 0.0}
-  forex:  {spread_bps: 1.5, slippage_bps: 1.0, commission_pct: 0.0, commission_fixed: 0.0}
+  forex:  {spread_bps: 2.0, slippage_bps: 1.0, commission_pct: 0.0, commission_fixed: 0.0}   # crosses are wider than majors
 
 # Strategy approval gate (Backtesting Bot). A strategy must pass ALL of these
 # on out-of-sample (walk-forward) data AND on a final untouched holdout.
