@@ -54,5 +54,13 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     mid = sma(c, 20)
     sd = c.rolling(20, min_periods=20).std()
     out["bb_mid"], out["bb_up"], out["bb_dn"] = mid, mid + 2 * sd, mid - 2 * sd
+    # MACD (12/26 EMA difference) and its 9-period signal line
+    out["macd"] = ema(c, 12) - ema(c, 26)
+    out["macd_sig"] = out["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
+    # Turtle 55-bar channel (previous 55 bars) and 52-week high
+    out["dc55_high"] = out["high"].rolling(55).max().shift(1)
+    out["dc55_low"] = out["low"].rolling(55).min().shift(1)
+    out["hi252"] = out["high"].rolling(252, min_periods=252).max()
+    out["lo252"] = out["low"].rolling(252, min_periods=252).min()
     out["dollar_vol"] = (c * out["volume"]).rolling(20, min_periods=5).mean()
     return out

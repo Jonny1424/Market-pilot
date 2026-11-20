@@ -160,7 +160,88 @@ class TrendSMA200(Strategy):
         return None
 
 
-ALL_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback]
+class BollingerReversion(Strategy):
+    """Bollinger Band pullback: in an uptrend (close > SMA200), buy a close below
+    the lower band (2 standard deviations under the 20-day average); exit when
+    price closes back above the 20-day average (the middle band)."""
+    name, family = "bollinger_reversion", "mean-reversion"
+    regimes = frozenset({"ranging", "trending", "volatile"})
+    grid = {"stop": [2.5, 3.5]}
+
+    def signal(self, prev, row):
+        if _na(row["bb_dn"], row["sma200"], row["atr14"]):
+            return None
+        p = self.params
+        if row["close"] < row["bb_dn"] and row["close"] > row["sma200"]:
+            return Signal(1, p["stop"], NO_TARGET, 15, "close below lower Bollinger band in uptrend",
+                          exit_ma=20, exit_on="revert")
+        if row["close"] > row["bb_up"] and row["close"] < row["sma200"]:
+            return Signal(-1, p["stop"], NO_TARGET, 15, "close above upper Bollinger band in downtrend",
+                          exit_ma=20, exit_on="revert")
+        return None
+
+
+class Turtle55(Strategy):
+    """Turtle-style breakout: buy a close above the highest high of the last 55
+    bars; protect with a 2-ATR stop that trails behind the best close."""
+    name, family = "turtle_55", "breakout"
+    regimes = frozenset({"trending", "volatile", "ranging"})
+    grid = {"stop": [2.0, 3.0], "trail": [3.0, 4.5]}
+
+    def signal(self, prev, row):
+        if _na(row["dc55_high"], prev["dc55_high"], row["atr14"]):
+            return None
+        p = self.params
+        if row["close"] > row["dc55_high"] and prev["close"] <= prev["dc55_high"]:
+            return Signal(1, p["stop"], NO_TARGET, 120, "close broke 55-bar high", trail_atr=p["trail"])
+        if row["close"] < row["dc55_low"] and prev["close"] >= prev["dc55_low"]:
+            return Signal(-1, p["stop"], NO_TARGET, 120, "close broke 55-bar low", trail_atr=p["trail"])
+        return None
+
+
+class MACDTrend(Strategy):
+    """MACD crossover in the direction of the 200-day trend; exit on a close back
+    through the 50-day average or a trailing stop."""
+    name, family = "macd_trend", "trend-following"
+    regimes = frozenset({"trending", "ranging", "volatile"})
+    grid = {"stop": [2.0, 3.0], "trail": [0.0, 3.0]}
+
+    def signal(self, prev, row):
+        if _na(row["macd_sig"], prev["macd_sig"], row["sma200"], row["sma50"], row["atr14"]):
+            return None
+        p = self.params
+        if prev["macd"] <= prev["macd_sig"] and row["macd"] > row["macd_sig"] and row["close"] > row["sma200"]:
+            return Signal(1, p["stop"], NO_TARGET, 80, "MACD crossed above signal, above 200-day avg",
+                          trail_atr=p["trail"], exit_ma=50, exit_on="break")
+        if prev["macd"] >= prev["macd_sig"] and row["macd"] < row["macd_sig"] and row["close"] < row["sma200"]:
+            return Signal(-1, p["stop"], NO_TARGET, 80, "MACD crossed below signal, below 200-day avg",
+                          trail_atr=p["trail"], exit_ma=50, exit_on="break")
+        return None
+
+
+class High52Week(Strategy):
+    """52-week-high momentum (George & Hwang 2004): buy when price closes at a new
+    52-week high while the 50-day average is above the 200-day; exit on a close
+    below the 50-day average or a trailing stop."""
+    name, family = "high_52week", "momentum"
+    regimes = frozenset({"trending", "ranging", "volatile"})
+    grid = {"stop": [2.5, 3.5], "trail": [0.0, 4.0]}
+
+    def signal(self, prev, row):
+        if _na(row["hi252"], prev["hi252"], row["sma200"], row["sma50"], row["atr14"]):
+            return None
+        p = self.params
+        if row["close"] >= prev["hi252"] and prev["close"] < prev["hi252"] and row["sma50"] > row["sma200"]:
+            return Signal(1, p["stop"], NO_TARGET, 120, "new 52-week high in an uptrend",
+                          trail_atr=p["trail"], exit_ma=50, exit_on="break")
+        if row["close"] <= prev["lo252"] and prev["close"] > prev["lo252"] and row["sma50"] < row["sma200"]:
+            return Signal(-1, p["stop"], NO_TARGET, 120, "new 52-week low in a downtrend",
+                          trail_atr=p["trail"], exit_ma=50, exit_on="break")
+        return None
+
+
+ALL_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback,
+                                        BollingerReversion, Turtle55, MACDTrend, High52Week]
 
 
 def strategy_from_key(key: str) -> Strategy:

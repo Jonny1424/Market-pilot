@@ -18,6 +18,7 @@ from . import notify
 from .backtest import plan_levels
 from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
+from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
 from .bots.news import NewsBot
 from .bots.performance import realized_today, report, retirement_review
 from .bots.regime import classify_row
@@ -55,6 +56,9 @@ class Engine:
         self.risk = RiskManager(settings)
         self.decider = DecisionBot(settings)
         self.broker = PaperBroker(store, on_open=notify.trade_opened, on_close=notify.trade_closed)
+        self.shadow_view = ShadowView(store)
+        self.shadow = PaperBroker(self.shadow_view)          # Learning Lab: no alerts
+        self.learning_on = bool(settings.raw.get("learning", {}).get("enabled", True))
 
     def log(self, bot, msg, level="info"):
         self.store.log(bot, msg, level, self._ts)
@@ -78,7 +82,11 @@ class Engine:
     def cycle(self, now: datetime) -> dict:
         now_ts = pd.Timestamp(now)
         self._ts = now_ts.isoformat()
-        summary = {"new_orders": 0, "closed": 0, "candidates": 0, "rejected": 0, "failed_feeds": 0}
+        summary = {"new_orders": 0, "closed": 0, "candidates": 0, "rejected": 0, "failed_feeds": 0,
+                   "shadow_opened": 0, "shadow_closed": 0}
+        if self.learning_on:
+            self.shadow_view.refresh()
+            shadow_params = researched_params(self.store)
         approved = {}
         for a in self.store.strategies("approved"):
             approved.setdefault(a["symbol"], []).append(a)
@@ -111,6 +119,13 @@ class Engine:
 
             closed = self.broker.process(symbol, ind, interval, cost, now_ts, self.log)
             summary["closed"] += len(closed)
+
+            if self.learning_on:  # Learning Lab: every strategy, every market, practice ledger
+                summary["shadow_closed"] += len(self.shadow.process(symbol, ind, interval, cost, now_ts,
+                                                                    lambda *a, **k: None))
+                if tradable:
+                    summary["shadow_opened"] += shadow_signals(self.shadow_view, self.shadow, symbol, cls, ind,
+                                                               classify_row(ind.iloc[-1]), shadow_params)
 
             if not tradable or symbol not in approved:
                 continue
@@ -186,6 +201,12 @@ class Engine:
             self.safety.engage(f"equity £{eq:.2f} is >15% below starting balance", self._ts)
         for msg in retirement_review(self.store, self.s):
             self.log("performance", msg, "warning")
+        if self.learning_on:
+            for msg in apply_learning(self.store, self.s, self.log):
+                notify.send("MarketPilot learned something", msg, tags="brain", priority=3)
+            if summary["shadow_opened"] or summary["shadow_closed"]:
+                self.log("learning_lab", f"shadow trades opened {summary['shadow_opened']}, "
+                         f"closed {summary['shadow_closed']}")
         if not was_killed and self.safety.kill_switch_on():
             notify.kill_switch(self.store.get_control("pause_reason", "") or "safety rule triggered")
         self._daily_summary(now_ts, trades, eq, n_open)

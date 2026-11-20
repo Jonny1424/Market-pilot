@@ -29,6 +29,7 @@ TABLES = {
         r_multiple REAL, last_bar_time TEXT, signal_bar_time TEXT, atr REAL,
         stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT, trail_atr REAL,
         exit_ma INTEGER, exit_on TEXT, best_price REAL""",
+    "mp_shadow_trades": None,  # filled below: same columns as mp_trades
     "mp_strategies": """
         strategy_id TEXT PRIMARY KEY, symbol TEXT, asset_class TEXT, strategy TEXT,
         family TEXT, params TEXT, status TEXT, reasons TEXT, oos TEXT, holdout TEXT,
@@ -40,6 +41,7 @@ TABLES = {
     "mp_control": """
         key TEXT PRIMARY KEY, value TEXT, updated_at TEXT""",
 }
+TABLES["mp_shadow_trades"] = TABLES["mp_trades"]
 JSON_FIELDS = {"reasons", "evidence", "oos", "holdout"}
 
 
@@ -91,6 +93,17 @@ class BaseStore:
     def trades(self, status: str | None = None) -> list[dict]:
         where = {"status": status} if status else None
         return self._select("mp_trades", where, order="opened_at", desc=True)
+
+    # --- Learning Lab shadow ledger (practice trades, never on the real paper account) ---
+    def open_shadow(self, row: dict) -> bool:
+        return self._insert("mp_shadow_trades", _enc({"status": "open", "bars_held": 0, **row}), ignore_conflict=True)
+
+    def update_shadow(self, trade_id: str, changes: dict) -> None:
+        self._update("mp_shadow_trades", "trade_id", trade_id, _enc(changes))
+
+    def shadow_trades(self, status: str | None = None) -> list[dict]:
+        where = {"status": status} if status else None
+        return self._select("mp_shadow_trades", where, order="opened_at", desc=True)
 
     def save_strategy(self, row: dict) -> None:
         self._upsert("mp_strategies", _enc(row), "strategy_id")
@@ -168,7 +181,8 @@ class SupabaseStore(BaseStore):
 
     def _insert(self, table, row, ignore_conflict=False):
         if ignore_conflict:
-            pk = {"mp_candidates": "candidate_id", "mp_trades": "candidate_id"}.get(table)
+            pk = {"mp_candidates": "candidate_id", "mp_trades": "candidate_id",
+                  "mp_shadow_trades": "candidate_id"}.get(table)
             if pk and row.get(pk) is not None:
                 if self.db.table(table).select(pk).eq(pk, row[pk]).limit(1).execute().data:
                     return False
