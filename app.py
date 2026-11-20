@@ -1,4 +1,4 @@
-"""MarketPilot v0.4 dashboard (Streamlit).
+"""MarketPilot v0.5 dashboard (Streamlit).
 
 The bots run in the scheduled worker (GitHub Actions); this app only reads the
 results and lets you flip the kill switch or trigger a cycle manually.
@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="MarketPilot v0.4", page_icon="📈", layout="wide")
+st.set_page_config(page_title="MarketPilot v0.5", page_icon="📈", layout="wide")
 
 BLUE, ORANGE, GOOD, CRITICAL, MUTED, GRID = "#2a78d6", "#eb6834", "#0ca30c", "#d03b3b", "#898781", "#e1e0d9"
 
@@ -70,7 +70,7 @@ store, backend = get_store()
 start_bal = settings.account["starting_balance"]
 target_wr = settings["goals"]["target_win_rate"]
 
-st.title("📈 MarketPilot v0.4 — multi-agent paper trading")
+st.title("📈 MarketPilot v0.5 — multi-agent paper trading")
 kill = store.get_control("kill_switch", "off") == "on"
 c1, c2 = st.columns([3, 1])
 c1.caption(f"Storage: {backend} • Paper trading only — no live orders, no broker connection. Not financial advice.")
@@ -187,12 +187,15 @@ with tabs[2]:
         g["OOS win rate"] = g["oos"].apply(lambda x: x["win_rate"])
         g["OOS expectancy R"] = g["oos"].apply(lambda x: x["expectancy_r"])
         g["OOS profit factor"] = g["oos"].apply(lambda x: x["profit_factor"])
+        g["OOS t-stat"] = g["oos"].apply(lambda x: x.get("t_stat", float("nan")))
         g["Holdout expectancy R"] = g["holdout"].apply(lambda x: x["expectancy_r"])
         g["Why"] = g["reasons"].apply(lambda r: "; ".join(r) if r else "passed all gates")
         st.dataframe(g[["asset_class", "strategy", "status", "OOS trades", "OOS win rate", "OOS expectancy R",
-                        "OOS profit factor", "Holdout expectancy R", "Why"]].style.format(
+                        "OOS profit factor", "OOS t-stat", "Holdout expectancy R", "Why"]].style.format(
             {"OOS win rate": "{:.0%}", "OOS expectancy R": "{:+.3f}", "OOS profit factor": "{:.2f}",
-             "Holdout expectancy R": "{:+.3f}"}), hide_index=True, width="stretch")
+             "OOS t-stat": "{:.1f}", "Holdout expectancy R": "{:+.3f}"}), hide_index=True, width="stretch")
+        st.caption("t-stat = how many standard errors the average result is above zero. Below 2 means the "
+                   "result could easily be luck, so the strategy is not traded.")
         fig = go.Figure(go.Scatter(
             x=g["OOS win rate"], y=g["OOS expectancy R"], mode="markers+text", text=g["strategy"] + " · " + g["asset_class"],
             textposition="top center", textfont=dict(size=10, color=MUTED),
@@ -264,6 +267,10 @@ with tabs[6]:
         with st.spinner("Scanning markets…"):
             s = Engine(settings, make_provider("yfinance"), store).cycle(datetime.now(timezone.utc))
         st.success(f"Cycle done: {s}")
+    st.divider()
+    st.subheader("Phone notifications")
+    st.caption("Trade alerts and a daily summary are sent by the GitHub worker through the free ntfy app. "
+               "To test: GitHub → Actions → MarketPilot worker → Run workflow → command `notify-test`.")
     st.divider()
     st.subheader("Risk settings (from config/settings.yaml)")
     a = settings.account

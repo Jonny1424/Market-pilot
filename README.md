@@ -1,8 +1,14 @@
-# MarketPilot v0.4 — Multi-Agent AI Paper Trading
+# MarketPilot v0.5 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
-**automatically open and close paper trades** across S&P 500 stocks/ETFs, crypto
-and forex — logging every decision, win and loss.
+**automatically open and close paper trades** across US stock-market, bond and gold
+ETFs, crypto and forex — logging every decision, win and loss, with push
+notifications to your phone.
+
+**v0.5:** research-backed upgrade — see [docs/RESEARCH.md](docs/RESEARCH.md). Broad
+ETF universe (no hindsight stock picks), daily bars for crypto and forex, a 200-day
+trend strategy, a market trend filter, Connors' RSI(2) exit, trailing-stop variants,
+realistic crypto fees, a t-statistic test against luck, and phone notifications.
 
 > **Paper trading only.** There is no broker connection and no code path that
 > places real orders. Live trading should only be considered after months of
@@ -43,7 +49,8 @@ Scanner ─► Regime ─► approved strategy signals ─► News veto ─► T
    orders fill at the next bar's open; gaps through stops fill at the worse price.
 2. Out-of-sample trades are **pooled across each market** (stocks, crypto, forex).
 3. **Approval gate** (in `config/settings.yaml`): ≥30 OOS trades, expectancy
-   ≥ +0.05R, profit factor ≥ 1.15, *and* non-negative on a final untouched holdout.
+   ≥ +0.05R, profit factor ≥ 1.15, t-statistic ≥ 2, *and* non-negative on a final
+   untouched holdout.
 4. Live paper results are blended in; strategies that go negative over 30+
    forward trades are **retired** automatically.
 
@@ -83,6 +90,19 @@ After that it trades every hour at :07 and re-researches every Saturday.
 (GitHub pauses scheduled workflows after 60 days with no commits — push a
 commit or re-enable it if that happens.)
 
+### 2b. Phone notifications (optional, free)
+1. Install **ntfy** from the App Store / Google Play and subscribe to a private topic
+   name (treat it like a password — anyone who knows it can read the alerts).
+2. Add that name as the GitHub Actions secret `NTFY_TOPIC`.
+3. Actions → MarketPilot worker → Run workflow → `notify-test`.
+
+You'll get a message when a paper trade opens or closes, if the kill switch trips,
+and a daily summary at 21:00 UTC.
+
+### 2c. Upgrading from v0.4
+Run `supabase/migrations/20261120_marketpilot_v05.sql` in the Supabase SQL Editor,
+then run the worker with `research` once.
+
 ### 3. Streamlit dashboard
 In Streamlit Community Cloud secrets add `APP_PASSWORD`, `SUPABASE_URL` and
 `SUPABASE_SERVICE_KEY`. The app file is still `app.py`.
@@ -97,7 +117,7 @@ python -m marketpilot research                # real data (Yahoo Finance)
 python -m marketpilot run-once                # one trading cycle
 python -m marketpilot report                  # win rate, win/loss, expectancy, P&L
 python -m marketpilot kill   |  resume        # kill switch
-pytest                                        # 20 tests
+pytest                                        # 31 tests
 ```
 
 Add `--db supabase` (with `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` in env) to use Supabase.
