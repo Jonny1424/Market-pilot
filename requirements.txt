@@ -8,3 +8,4 @@ plotly>=5.20
 anthropic>=0.40
 ccxt>=4.3
 pytest>=8.0
+requests>=2.31

@@ -39,7 +39,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     c = out["close"]
     out["ema20"], out["ema50"] = ema(c, 20), ema(c, 50)
-    out["sma50"], out["sma200"] = sma(c, 50), sma(c, 200)
+    for n in (5, 10, 20, 50, 200):
+        out[f"sma{n}"] = sma(c, n)
+    out["roc252"] = c.pct_change(252)
     out["atr14"] = atr(out, 14)
     out["atr_pct"] = out["atr14"] / c
     out["atr_pct_rank"] = out["atr_pct"].rolling(250, min_periods=50).rank(pct=True)

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from ..backtest import passes_gate, walk_forward
+from ..backtest import market_filter_series, passes_gate, walk_forward
 from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
@@ -25,6 +25,11 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
     gate = {**settings["approval"], **(gate_override or {})}
     retired = {s["strategy_id"] for s in store.strategies("retired")}
     wanted = set(symbols or settings.all_symbols())
+    universe = set(settings.all_symbols())
+    for old in store.strategies("approved"):  # symbols dropped from the universe stop trading
+        if old["symbol"] not in universe:
+            store.save_strategy({**old, "status": "removed", "reasons": ["symbol no longer in universe"]})
+    filters = settings.raw.get("market_filter") or {}
     rows_out = []
     for cls_name, spec in settings["universe"].items():
         data = {}
@@ -43,11 +48,25 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
         if not data:
             continue
         cost = cost_model_for(settings, cls_name)
+        filt_spec = filters.get(cls_name)
+        filt_df = None
+        if filt_spec:
+            filt_df = data.get(filt_spec["symbol"])
+            if filt_df is None:
+                try:
+                    filt_df = provider.history(filt_spec["symbol"], "1d",
+                                               now - timedelta(days=spec["lookback_days"]), now)
+                except Exception:
+                    filt_df = None
         for strat in ALL_STRATEGIES:
             per_symbol, oos_r, hold_r, costs = {}, [], [], []
             for symbol, df in data.items():
+                mk = None
+                if filt_spec and symbol not in set(filt_spec.get("exclude", [])):
+                    mk = market_filter_series(filt_df, df.index)
                 r = walk_forward(df, strat, cost, cls_name in SHORTABLE,
-                                 folds=gate["walk_forward_folds"], holdout_fraction=gate["holdout_fraction"])
+                                 folds=gate["walk_forward_folds"], holdout_fraction=gate["holdout_fraction"],
+                                 market_ok=mk)
                 per_symbol[symbol] = r
                 oos_r += [t.r_multiple for t in r["oos_trades"]]
                 hold_r += [t.r_multiple for t in r["holdout_trades"]]
@@ -57,7 +76,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
             o = pooled["oos"]
             log(f"research: {cls_name:<7} {strat.name:<20} {'APPROVED' if ok else 'rejected':<9} "
                 f"OOS n={o['trades']:<4} win {o['win_rate']:.0%} exp {o['expectancy_r']:+.3f}R "
-                f"PF {o['profit_factor']:.2f} | holdout n={pooled['holdout']['trades']} "
+                f"PF {o['profit_factor']:.2f} t {o['t_stat']:.1f} | holdout n={pooled['holdout']['trades']} "
                 f"exp {pooled['holdout']['expectancy_r']:+.3f}R" + ("" if ok else f"  — {reasons[0]}"))
             for symbol, r in per_symbol.items():
                 sid = f"{symbol}|{strat.name}"

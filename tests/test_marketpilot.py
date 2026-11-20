@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from marketpilot.backtest import check_exit, passes_gate, plan_levels, realized_r, run_backtest
+from marketpilot.backtest import (check_exit, market_filter_series, passes_gate, plan_levels, realized_r,
+                                  run_backtest, step_position)
 from marketpilot.bots.autotrader import PaperBroker
 from marketpilot.bots.decision import DecisionBot
 from marketpilot.bots.risk import RiskManager
@@ -15,7 +16,8 @@ from marketpilot.engine import Engine
 from marketpilot.indicators import add_indicators
 from marketpilot.metrics import summarize
 from marketpilot.storage import SQLiteStore
-from marketpilot.strategies import Breakout, MeanReversion, Signal, TrendFollowing, strategy_from_key
+from marketpilot.strategies import (NO_TARGET, Breakout, MeanReversion, Signal, TrendFollowing, TrendSMA200,
+                                    strategy_from_key)
 
 UTC = timezone.utc
 
@@ -23,6 +25,15 @@ UTC = timezone.utc
 @pytest.fixture
 def settings():
     return load_settings()
+
+
+@pytest.fixture
+def small_settings():
+    s = load_settings()
+    s.raw["universe"] = {"forex": {"interval": "1d", "lookback_days": 3000, "symbols": ["EURUSD=X"]},
+                         "stocks": {"interval": "1d", "lookback_days": 3000, "symbols": ["SPY"]}}
+    s.raw["market_filter"] = {}
+    return s
 
 
 @pytest.fixture
@@ -159,7 +170,7 @@ def test_paper_broker_matches_backtest(store):
     # feed bars one at a time, like hourly worker runs
     for k in range(i + 1, len(df)):
         now = df.index[k] + pd.Timedelta(hours=1)
-        broker.process("EURUSD=X", df.iloc[: k + 1], "1h", cost, now, lambda *a, **kw: None)
+        broker.process("EURUSD=X", ind.iloc[: k + 1], "1h", cost, now, lambda *a, **kw: None)
         tr = store.trades()[0]
         if tr["status"] == "closed":
             break
@@ -177,7 +188,8 @@ def test_late_worker_cancels_instead_of_backfilling(store):
     broker.submit(candidate_id="c1", symbol="EURUSD=X", asset_class="forex", strategy_key="x",
                   signal=Signal(1, 2, 3, 10), regime="ranging", bar_time=df.index[100], atr=0.001, qty=1,
                   risk_gbp=2.5, risk_per_unit=0.002, fx=1, notional=1, cost_r=0)
-    broker.process("EURUSD=X", df, "1h", CostModel(), df.index[-1] + pd.Timedelta(hours=1), lambda *a, **k: None)
+    broker.process("EURUSD=X", add_indicators(df), "1h", CostModel(), df.index[-1] + pd.Timedelta(hours=1),
+                   lambda *a, **k: None)
     assert store.trades()[0]["status"] == "cancelled"
 
 
@@ -186,17 +198,18 @@ def test_candidates_are_idempotent(store):
     assert not store.record_candidate({"candidate_id": "AAPL|x|t1"})
 
 
-def test_engine_cycle_twice_does_not_duplicate_orders(settings, store):
+def test_engine_cycle_twice_does_not_duplicate_orders(small_settings, store):
+    settings = small_settings
     provider = SyntheticProvider()
     store.save_strategy({"strategy_id": "EURUSD=X|breakout_donchian", "symbol": "EURUSD=X", "asset_class": "forex",
                          "strategy": "breakout_donchian", "family": "breakout",
                          "params": Breakout(stop=1.5, target=3.0).key, "status": "approved", "reasons": [],
                          "oos": {"trades": 500, "expectancy_r": 0.3, "win_rate": 0.4}, "holdout": {}})
     eng = Engine(settings, provider, store, live=False)
-    t = datetime(2026, 3, 2, 0, tzinfo=UTC)
+    t = datetime(2025, 9, 1, 0, 7, tzinfo=UTC)
     seen = 0
-    for h in range(24 * 10):
-        now = t + timedelta(hours=h)
+    for d in range(200):
+        now = t + timedelta(days=d)
         eng.cycle(now)
         eng.cycle(now)  # duplicate run at the same moment (e.g. overlapping cron)
         seen = len(store.trades())
@@ -205,7 +218,8 @@ def test_engine_cycle_twice_does_not_duplicate_orders(settings, store):
     assert seen >= 1
 
 
-def test_kill_switch_stops_new_trades_but_manages_positions(settings, store):
+def test_kill_switch_stops_new_trades_but_manages_positions(small_settings, store):
+    settings = small_settings
     SafetyBot(store, settings).engage("test")
     assert store.get_control("kill_switch") == "on"
     store.save_strategy({"strategy_id": "EURUSD=X|b", "symbol": "EURUSD=X", "asset_class": "forex",
@@ -213,9 +227,9 @@ def test_kill_switch_stops_new_trades_but_manages_positions(settings, store):
                          "params": Breakout(stop=1.5, target=3.0).key, "status": "approved", "reasons": [],
                          "oos": {"trades": 500, "expectancy_r": 0.3, "win_rate": 0.4}, "holdout": {}})
     eng = Engine(settings, SyntheticProvider(), store, live=False)
-    t = datetime(2026, 3, 2, tzinfo=UTC)
-    for h in range(24 * 5):
-        eng.cycle(t + timedelta(hours=h))
+    t = datetime(2025, 9, 1, 0, 7, tzinfo=UTC)
+    for d in range(200):
+        eng.cycle(t + timedelta(days=d))
     assert not store.trades()
     rejected = [c for c in store.candidates() if c["decision"] == "reject"]
     assert rejected and any("kill switch" in r for c in rejected for r in c["reasons"])
@@ -227,3 +241,118 @@ def test_stale_data_detection():
     assert not is_stale("crypto", "1h", now - pd.Timedelta(hours=1), now, 3.0)
     sat = pd.Timestamp("2026-11-21 12:00", tz="UTC")
     assert not is_stale("forex", "1h", pd.Timestamp("2026-11-20 20:00", tz="UTC"), sat, 3.0)
+
+
+# ---------------- v0.5 ----------------
+
+def _st(**kw):
+    base = {"direction": 1, "stop": 90.0, "target": 1e9, "held": 1, "max_hold": 10,
+            "trail_atr": 0.0, "exit_ma": 0, "exit_on": "", "best": None}
+    base.update(kw)
+    return base
+
+
+def test_connors_exit_on_close_above_5day_average():
+    st = _st(exit_ma=5, exit_on="revert")
+    bar = {"open": 100, "high": 103, "low": 99, "close": 102, "atr14": 2.0, "sma5": 101.0}
+    px, reason = step_position(st, bar, CostModel(), entry_bar=False)
+    assert reason.startswith("close above 5") and px == 102
+
+
+def test_trend_exit_on_close_below_200day_average():
+    st = _st(exit_ma=200, exit_on="break")
+    bar = {"open": 100, "high": 101, "low": 97, "close": 98, "atr14": 2.0, "sma200": 99.0}
+    _, reason = step_position(st, bar, CostModel(), entry_bar=False)
+    assert reason.startswith("close below 200")
+
+
+def test_trailing_stop_only_moves_in_our_favour():
+    st = _st(trail_atr=3.0)
+    step_position(st, {"open": 100, "high": 111, "low": 99, "close": 110, "atr14": 2.0}, CostModel(), False)
+    assert st["stop"] == pytest.approx(104.0)   # 110 - 3*2
+    step_position(st, {"open": 109, "high": 109, "low": 105, "close": 106, "atr14": 2.0}, CostModel(), False)
+    assert st["stop"] == pytest.approx(104.0)   # never loosens
+    _, reason = step_position(st, {"open": 105, "high": 105, "low": 103, "close": 104, "atr14": 2.0},
+                              CostModel(), False)
+    assert reason == "stop"
+
+
+def test_no_target_variants_without_exit_are_dropped():
+    for cls in (TrendFollowing, Breakout):
+        for v in cls.variants():
+            assert not (v.params["target"] >= NO_TARGET and v.params["trail"] == 0)
+
+
+def test_trend_sma200_signal_requires_positive_12m_return():
+    s = TrendSMA200()
+    prev = {"close": 99, "sma200": 100, "roc252": 0.1, "atr14": 1}
+    row = {"close": 101, "sma200": 100, "roc252": 0.1, "atr14": 1}
+    assert s.signal(prev, row).direction == 1
+    assert s.signal(prev, {**row, "roc252": -0.05}) is None
+
+
+def test_market_filter_blocks_long_entries():
+    df = SyntheticProvider().history("SPY", "1d", datetime(2018, 1, 1, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC))
+    ind = add_indicators(df)
+    strat = Breakout(stop=1.5, target=4.0)
+    free = run_backtest(ind, strat, CostModel(), allow_short=False)
+    blocked = run_backtest(ind, strat, CostModel(), allow_short=False,
+                           market_ok=pd.Series(False, index=ind.index))
+    assert free and not blocked
+
+
+def test_market_filter_series_has_no_lookahead():
+    df = SyntheticProvider().history("SPY", "1d", datetime(2018, 1, 1, tzinfo=UTC), datetime(2024, 1, 1, tzinfo=UTC))
+    full = market_filter_series(df, df.index)
+    part = market_filter_series(df.iloc[:900], df.index[:900])
+    assert (full.iloc[:900].values == part.values).all()
+
+
+def test_gate_requires_t_stat(settings):
+    gate = settings["approval"]
+    noisy = [3.0, -1.0, -1.0, 2.5, -1.0, -1.0, -1.0, 2.0] * 5   # positive mean, high variance
+    res = {"oos": summarize(noisy), "holdout": summarize([1.0, -0.5] * 6)}
+    ok, reasons = passes_gate(res, gate)
+    assert summarize(noisy)["expectancy_r"] > 0.05
+    assert not ok and any("t-stat" in r for r in reasons)
+
+
+def test_notify_is_silent_without_topic(monkeypatch):
+    from marketpilot import notify
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    assert notify.send("x", "y") is False
+
+
+def test_notify_posts_to_topic(monkeypatch):
+    import sys
+    import types
+    from marketpilot import notify
+    sent = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        sent.update(url=url, data=data, headers=headers)
+        return types.SimpleNamespace(ok=True)
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(post=fake_post))
+    monkeypatch.setenv("NTFY_TOPIC", "mp-test-topic")
+    notify.trade_closed({"symbol": "SPY", "r_multiple": 1.8, "pnl_gbp": 4.5, "exit_reason": "target",
+                         "exit_price": 501.2, "strategy": "trend_sma200(stop=3,trail=4)"})
+    assert sent["url"].endswith("/mp-test-topic")
+    assert sent["headers"]["Title"].startswith("WIN: SPY +1.80R")
+
+
+def test_removed_symbol_position_still_managed(small_settings, store):
+    settings = small_settings
+    """A position in a symbol dropped from the universe (e.g. XOM) keeps its stops managed."""
+    provider = SyntheticProvider()
+    df = provider.history("XOM", "1d", datetime(2025, 1, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC))
+    store.record_candidate({"candidate_id": "old"})
+    PaperBroker(store).submit(candidate_id="old", symbol="XOM", asset_class="stocks", strategy_key="x",
+                              signal=Signal(1, 2.5, 1.5, 10), regime="ranging", bar_time=df.index[-15],
+                              atr=float(add_indicators(df)["atr14"].iloc[-15]), qty=1, risk_gbp=2.5,
+                              risk_per_unit=1, fx=0.79, notional=40, cost_r=0)
+    eng = Engine(settings, provider, store, live=False)
+    eng.cycle(df.index[-14].to_pydatetime() + timedelta(days=1, minutes=7))
+    assert store.trades()[0]["status"] in ("open", "closed")
+    for k in range(13, 0, -1):
+        eng.cycle(df.index[-k].to_pydatetime() + timedelta(days=1, minutes=7))
+    assert store.trades()[0]["status"] == "closed"   # max hold 10 bars at most

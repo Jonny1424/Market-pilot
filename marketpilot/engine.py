@@ -1,11 +1,12 @@
 """Orchestrator: one cycle of the 10-bot pipeline.
 
-  Safety -> (per symbol) data -> stale check -> Auto-Trader manages positions
-  -> Scanner -> Regime -> approved strategies' signals -> News veto
+  Safety -> market filters -> (per symbol) data -> stale check -> Auto-Trader manages
+  positions -> Scanner -> Regime -> approved strategies' signals -> News veto
   -> Trade Decision (EV, may abstain) -> Risk Manager -> paper order
-  -> Performance snapshot
+  -> Performance snapshot -> phone notifications
 
 Kill switch ON: open positions are still managed (stops/targets honoured), no new trades.
+Positions in symbols removed from the universe keep being managed until they close.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from . import notify
 from .backtest import plan_levels
 from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
@@ -30,6 +32,21 @@ from .strategies import SHORTABLE, strategy_from_key
 HISTORY_BARS = 700
 
 
+def market_filter_status(settings, provider, now: datetime) -> dict[str, dict]:
+    """Per asset class: {'symbol': 'SPY', 'ok': bool, 'exclude': [...]}. ok=None if unknown."""
+    out = {}
+    for cls, spec in (settings.raw.get("market_filter") or {}).items():
+        sym = spec["symbol"]
+        try:
+            df = provider.history(sym, "1d", now - timedelta(days=500), now)
+            c = df["close"]
+            ok = bool(c.iloc[-1] > c.rolling(200).mean().iloc[-1]) if len(c) >= 200 else None
+        except Exception:
+            ok = None
+        out[cls] = {"symbol": sym, "ok": ok, "exclude": set(spec.get("exclude", []))}
+    return out
+
+
 class Engine:
     def __init__(self, settings, provider, store, live: bool = True):
         self.s, self.provider, self.store, self.live = settings, provider, store, live
@@ -37,7 +54,7 @@ class Engine:
         self.news = NewsBot(settings, live)
         self.risk = RiskManager(settings)
         self.decider = DecisionBot(settings)
-        self.broker = PaperBroker(store)
+        self.broker = PaperBroker(store, on_open=notify.trade_opened, on_close=notify.trade_closed)
 
     def log(self, bot, msg, level="info"):
         self.store.log(bot, msg, level, self._ts)
@@ -48,6 +65,16 @@ class Engine:
                      if t["status"] == "open" and t["symbol"] in last_prices)
         return self.s.account["starting_balance"] + realized + unreal, realized
 
+    def _symbols(self) -> list[tuple[str, str, bool]]:
+        """(symbol, asset_class, tradable). Non-tradable = only managing an old position."""
+        out = [(s, self.s.asset_class_of(s), True) for s in self.s.all_symbols()]
+        known = {s for s, _, _ in out}
+        for t in self.store.trades():
+            if t["status"] in ("open", "pending") and t["symbol"] not in known and t.get("asset_class") in self.s["universe"]:
+                out.append((t["symbol"], t["asset_class"], False))
+                known.add(t["symbol"])
+        return out
+
     def cycle(self, now: datetime) -> dict:
         now_ts = pd.Timestamp(now)
         self._ts = now_ts.isoformat()
@@ -56,15 +83,16 @@ class Engine:
         for a in self.store.strategies("approved"):
             approved.setdefault(a["symbol"], []).append(a)
         last_prices: dict[str, float] = {}
-        symbols = self.s.all_symbols()
+        symbols = self._symbols()
         fx_cache: dict[str, float] = {}
+        filters = market_filter_status(self.s, self.provider, now)
+        was_killed = self.safety.kill_switch_on()
 
-        for symbol in symbols:
-            cls = self.s.asset_class_of(symbol)
-            interval = self.s.interval_of(symbol)
+        for symbol, cls, tradable in symbols:
+            interval = self.s["universe"][cls]["interval"]
             cost = cost_model_for(self.s, cls)
             step = interval_td(interval)
-            lookback = step * HISTORY_BARS * (1.6 if interval == "1d" else 1.0)
+            lookback = step * HISTORY_BARS * (1.6 if interval == "1d" and cls != "crypto" else 1.0)
             try:
                 df = self.provider.history(symbol, interval, now - lookback, now)
                 if df.empty:
@@ -79,13 +107,13 @@ class Engine:
                 self.log("monitoring", f"{symbol}: stale data (last bar {df.index[-1]}) — skipped", "warning")
                 continue
             last_prices[symbol] = float(df["close"].iloc[-1])
+            ind = add_indicators(df)
 
-            closed = self.broker.process(symbol, df, interval, cost, now_ts, self.log)
+            closed = self.broker.process(symbol, ind, interval, cost, now_ts, self.log)
             summary["closed"] += len(closed)
 
-            if symbol not in approved:
+            if not tradable or symbol not in approved:
                 continue
-            ind = add_indicators(df)
             row, prev = ind.iloc[-1], ind.iloc[-2]
             bar_time = ind.index[-1]
             regime = classify_row(row)
@@ -94,6 +122,7 @@ class Engine:
             if qc not in fx_cache:
                 fx_cache[qc] = self.provider.fx_to_gbp(qc, now)
             fx = fx_cache[qc]
+            mf = filters.get(cls)
 
             for appr in approved[symbol]:
                 strat = strategy_from_key(appr["params"])
@@ -105,12 +134,15 @@ class Engine:
                     continue
                 summary["candidates"] += 1
                 news = self.news.check(symbol, cls, now)
+                if mf and sig.direction == 1 and symbol not in mf["exclude"] and mf["ok"] is False:
+                    news = news + [f"market filter: {mf['symbol']} is below its 200-day average"]
                 live_r = [float(t["r_multiple"]) for t in self.store.trades("closed")
                           if t["symbol"] == symbol and t["strategy"] == strat.key]
                 dec = self.decider.decide(approval=appr, regime=regime, strategy_regimes=strat.regimes,
                                           scan=snap, news_vetoes=news, live_r=live_r)
                 reasons = list(dec.reasons)
                 risk_res = None
+                rpu = None
                 if dec.trade:
                     trades = self.store.trades()
                     eq, _ = self.equity(trades, last_prices)
@@ -148,14 +180,25 @@ class Engine:
         self.safety.end_of_cycle(summary["failed_feeds"], len(symbols), self._ts)
         trades = self.store.trades()
         eq, realized = self.equity(trades, last_prices)
-        self.store.snapshot_equity(self._ts, eq, realized,
-                                   sum(t["status"] == "open" for t in trades))
+        n_open = sum(t["status"] == "open" for t in trades)
+        self.store.snapshot_equity(self._ts, eq, realized, n_open)
         if eq < self.s.account["starting_balance"] * 0.85:
             self.safety.engage(f"equity £{eq:.2f} is >15% below starting balance", self._ts)
         for msg in retirement_review(self.store, self.s):
             self.log("performance", msg, "warning")
+        if not was_killed and self.safety.kill_switch_on():
+            notify.kill_switch(self.store.get_control("pause_reason", "") or "safety rule triggered")
+        self._daily_summary(now_ts, trades, eq, n_open)
         summary["equity"] = eq
         return summary
+
+    def _daily_summary(self, now_ts: pd.Timestamp, trades, eq: float, n_open: int) -> None:
+        hour = int(self.s.raw.get("notifications", {}).get("daily_summary_hour_utc", 21))
+        today = now_ts.strftime("%Y-%m-%d")
+        if now_ts.hour >= hour and self.store.get_control("summary_sent", "") != today:
+            rep = report(trades, self.s.account["starting_balance"])
+            notify.daily_summary(rep["overall"], eq, n_open, self.s["goals"]["target_win_rate"])
+            self.store.set_control("summary_sent", today)
 
 
 def run_demo(settings, store, start: datetime, days: int, relaxed: bool, log=print) -> dict:
@@ -165,16 +208,17 @@ def run_demo(settings, store, start: datetime, days: int, relaxed: bool, log=pri
     from .data import SyntheticProvider
     provider = SyntheticProvider()
     gate = {"min_oos_trades": 10, "min_oos_expectancy_r": -1.0, "min_oos_profit_factor": 0.0,
-            "min_holdout_trades": 1, "min_holdout_expectancy_r": -1.0} if relaxed else None
+            "min_oos_tstat": None, "min_holdout_trades": 1, "min_holdout_expectancy_r": -1.0} if relaxed else None
     research(settings, provider, store, start, gate_override=gate, log=log)
     eng = Engine(settings, provider, store, live=False)
     t = start
     end = start + timedelta(days=days)
     totals = {"new_orders": 0, "closed": 0}
+    step = timedelta(hours=1) if any(u["interval"] != "1d" for u in settings["universe"].values()) else timedelta(hours=6)
     while t <= end:
         s = eng.cycle(t)
         totals["new_orders"] += s["new_orders"]
         totals["closed"] += s["closed"]
-        t += timedelta(hours=1)
+        t += step
     rep = report(store.trades(), settings.account["starting_balance"])
     return {**totals, "overall": rep["overall"]}

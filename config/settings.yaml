@@ -10,27 +10,38 @@ account:
   max_leverage: 1.0              # 1.0 = no leverage (total notional <= equity)
   max_cost_fraction_of_risk: 0.35  # reject trades where costs eat >35% of 1R
 
-# Universe. Symbols use Yahoo Finance tickers (free, unofficial data).
-# interval: 1d for stocks/ETFs, 1h for crypto and forex.
+# Universe (v0.5). Symbols use Yahoo Finance tickers (free, unofficial data).
+# v0.5: broad ETFs instead of 10 hand-picked winners (removes hindsight /
+# survivorship bias); crypto and forex moved from 1h to daily bars, where the
+# research evidence for trend effects is (see docs/RESEARCH.md).
 universe:
-  stocks:
+  stocks:            # US index, sector, international, bond, gold & property ETFs
+    interval: 1d
+    lookback_days: 7300
+    symbols: [SPY, QQQ, IWM, DIA, EFA, EEM, XLK, XLF, XLE, XLV, XLY, XLP, XLI, XLU, XLB,
+              TLT, IEF, GLD, SLV, VNQ]
+  crypto:
     interval: 1d
     lookback_days: 3650
-    symbols: [SPY, QQQ, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, XOM]
-  crypto:
-    interval: 1h
-    lookback_days: 720
     symbols: [BTC-USD, ETH-USD, SOL-USD]
   forex:
-    interval: 1h
-    lookback_days: 720
-    symbols: [EURUSD=X, GBPUSD=X, USDJPY=X, EURGBP=X]
+    interval: 1d
+    lookback_days: 7300
+    symbols: [EURUSD=X, GBPUSD=X, USDJPY=X, EURGBP=X, AUDUSD=X, USDCAD=X]
+
+# Market trend filter (Faber 2007): no new LONG trades in a class while its
+# benchmark closes below its 200-day average. Bonds/gold are excluded because
+# they often rise when stocks fall.
+market_filter:
+  stocks: {symbol: SPY, exclude: [TLT, IEF, GLD, SLV]}
+  crypto: {symbol: BTC-USD}
 
 # Transaction cost model per asset class (applied in backtests AND paper fills).
 # bps = basis points (1 bp = 0.01%). Commission is per side.
 costs:
   stocks: {spread_bps: 2.0, slippage_bps: 3.0, commission_pct: 0.0, commission_fixed: 0.0}
-  crypto: {spread_bps: 10.0, slippage_bps: 10.0, commission_pct: 0.10, commission_fixed: 0.0}
+  # crypto: entry-tier taker fee on Kraken Pro is 0.40%, Coinbase Advanced 0.60%
+  crypto: {spread_bps: 10.0, slippage_bps: 10.0, commission_pct: 0.40, commission_fixed: 0.0}
   forex:  {spread_bps: 1.5, slippage_bps: 1.0, commission_pct: 0.0, commission_fixed: 0.0}
 
 # Strategy approval gate (Backtesting Bot). A strategy must pass ALL of these
@@ -39,6 +50,7 @@ approval:
   min_oos_trades: 30
   min_oos_expectancy_r: 0.05
   min_oos_profit_factor: 1.15
+  min_oos_tstat: 2.0             # mean R must be >= 2 standard errors above zero (guards against luck)
   min_holdout_trades: 8
   min_holdout_expectancy_r: 0.0
   holdout_fraction: 0.2
@@ -65,6 +77,9 @@ news:
   earnings_blackout_days: 1
   llm_enabled: false             # needs ANTHROPIC_API_KEY; veto-only, never a buy signal
   llm_model: claude-haiku-5-5
+
+notifications:                   # phone push via ntfy; set the NTFY_TOPIC secret to enable
+  daily_summary_hour_utc: 21
 
 safety:
   max_consecutive_feed_failures: 3
