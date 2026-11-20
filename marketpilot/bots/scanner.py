@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 
 MIN_BARS = 250
-MIN_DOLLAR_VOL = {"stocks": 5_000_000, "crypto": 1_000_000}
+MIN_DOLLAR_VOL = {"stocks": 5_000_000, "international": 2_000_000, "bonds": 5_000_000,
+                  "commodities": 2_000_000, "crypto": 1_000_000}
 
 
 def scan(symbol: str, asset_class: str, ind) -> dict:
@@ -19,6 +20,8 @@ def scan(symbol: str, asset_class: str, ind) -> dict:
         reasons.append(f"volatility too extreme (ATR {atr_pct:.1%} of price)")
     liq = float(last["dollar_vol"]) if np.isfinite(last["dollar_vol"]) else 0.0
     floor = MIN_DOLLAR_VOL.get(asset_class)  # forex volume on Yahoo is not meaningful
+    if floor and symbol.endswith(".L"):
+        floor *= 100                          # London prices are in pence
     if floor and liq < floor:
         reasons.append(f"illiquid (avg traded value {liq:,.0f} < {floor:,.0f})")
     trend = "up" if last["ema20"] > last["ema50"] else "down"
