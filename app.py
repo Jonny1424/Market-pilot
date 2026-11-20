@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="MarketPilot v0.5", page_icon="📈", layout="wide")
+st.set_page_config(page_title="MarketPilot v0.7", page_icon="📈", layout="wide")
 
 BLUE, ORANGE, GOOD, CRITICAL, MUTED, GRID = "#2a78d6", "#eb6834", "#0ca30c", "#d03b3b", "#898781", "#e1e0d9"
 
@@ -70,7 +70,7 @@ store, backend = get_store()
 start_bal = settings.account["starting_balance"]
 target_wr = settings["goals"]["target_win_rate"]
 
-st.title("📈 MarketPilot v0.5 — multi-agent paper trading")
+st.title("📈 MarketPilot v0.7 — multi-agent paper trading")
 kill = store.get_control("kill_switch", "off") == "on"
 c1, c2 = st.columns([3, 1])
 c1.caption(f"Storage: {backend} • Paper trading only — no live orders, no broker connection. Not financial advice.")
@@ -84,7 +84,8 @@ rep = report(trades, start_bal)
 o = rep["overall"]
 closed = rep["closed"]
 
-tabs = st.tabs(["Overview", "Bot decisions", "Strategies", "Positions", "Trade log", "Bot activity", "Controls"])
+tabs = st.tabs(["Overview", "Bot decisions", "Strategies", "Positions", "Trade log", "Bot activity", "Controls",
+                "Learning lab", "Learn"])
 
 # ---------------- Overview ----------------
 with tabs[0]:
@@ -277,3 +278,104 @@ with tabs[6]:
     st.write(f"Balance £{a['starting_balance']:,.0f} • risk {a['risk_per_trade_pct']}% per trade "
              f"(£{a['starting_balance'] * a['risk_per_trade_pct'] / 100:.2f}) • daily loss limit {a['daily_loss_limit_pct']}% • "
              f"max {a['max_open_positions']} positions • leverage {a['max_leverage']}x")
+
+
+# ---------------- Learning lab ----------------
+with tabs[7]:
+    from marketpilot.bots.learning import forward_stats
+    st.subheader("Learning lab — shadow bots practising every strategy on every market")
+    st.caption("Shadow trades follow exactly the same entry and exit rules as the real paper account but are "
+               "practice only: no position limits, no capital cap, no phone alerts, results in R. "
+               f"Strategies with {settings['learning']['promote_min_trades']}+ strong shadow trades "
+               f"(expectancy ≥ {settings['learning']['promote_min_expectancy_r']}R, t-stat ≥ "
+               f"{settings['learning']['promote_min_tstat']}) are promoted to the real paper account; approved "
+               f"ones that go negative over {settings['learning']['demote_min_trades']}+ are demoted.")
+    try:
+        shadow_all = pd.DataFrame(store.shadow_trades())
+    except Exception:
+        shadow_all = pd.DataFrame()
+    if shadow_all.empty:
+        st.info("No shadow trades yet. The shadow bots open practice trades whenever any strategy signals on "
+                "any of the markets — expect the first ones within a day or two.")
+    else:
+        n_open = int(shadow_all["status"].isin(["open", "pending"]).sum())
+        n_closed = int((shadow_all["status"] == "closed").sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Shadow trades open", n_open)
+        c2.metric("Shadow trades closed", n_closed)
+        fs = forward_stats(store)
+        if not fs.empty:
+            closed_r = shadow_all.loc[shadow_all["status"] == "closed", "r_multiple"].astype(float)
+            c3.metric("Shadow win rate (all)", f"{(closed_r > 0).mean():.0%}")
+            st.markdown("**Leaderboard** — strongest forward evidence first (ranked by t-stat, not by luckiest result)")
+            fs = fs.sort_values(["t_stat", "trades"], ascending=False)  # strongest evidence first
+            st.dataframe(fs[["asset_class", "strategy", "trades", "win_rate", "expectancy_r", "profit_factor",
+                             "t_stat", "max_drawdown_r"]].style.format(
+                {"win_rate": "{:.0%}", "expectancy_r": "{:+.3f}", "profit_factor": "{:.2f}", "t_stat": "{:.1f}",
+                 "max_drawdown_r": "{:.1f}"}), hide_index=True, width="stretch")
+            fig = go.Figure(go.Scatter(
+                x=fs["win_rate"], y=fs["expectancy_r"], mode="markers",
+                marker=dict(size=[max(8, min(30, n / 3)) for n in fs["trades"]], color=BLUE,
+                            line=dict(color="#fcfcfb", width=2)),
+                text=fs["strategy"] + " · " + fs["asset_class"] + " (" + fs["trades"].astype(str) + " trades)",
+                hovertemplate="%{text}<br>win %{x:.0%} · %{y:+.3f}R<extra></extra>"))
+            fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+            fig.add_vline(x=target_wr, line=dict(color=MUTED, dash="dash", width=1), annotation_text="win-rate goal")
+            fig.update_xaxes(title="shadow win rate", tickformat=".0%")
+            st.plotly_chart(style(fig, 360, "expectancy (R per trade)"), width="stretch")
+            st.caption("Bubble size = number of shadow trades. Top-right is the goal: high win rate AND positive "
+                       "expectancy. Small bubbles are not yet evidence.")
+        with st.expander("Open shadow positions"):
+            op = shadow_all[shadow_all["status"].isin(["open", "pending"])]
+            st.dataframe(op[["symbol", "asset_class", "strategy", "status", "opened_at", "entry_price", "stop"]],
+                         hide_index=True, width="stretch")
+
+# ---------------- Learn ----------------
+with tabs[8]:
+    st.subheader("Learn: the strategies and technical indicators MarketPilot uses")
+    st.markdown("### Key ideas")
+    st.markdown("""
+- **R (risk unit)** — every trade risks a fixed amount, here 0.5% of the account (£2.50 on £500). A win of
+  +2R made £5; a loss of −1R lost £2.50. Measuring in R makes different markets comparable.
+- **Win rate vs expectancy** — win rate is how often you win; **expectancy** is the average result per trade:
+  *win rate × average win − loss rate × average loss*. A 40% win rate with 2R wins and 1R losses makes
+  +0.2R per trade; an 80% win rate with 0.25R wins and 1.5R losses loses money.
+- **Stop-loss** — the price where a losing trade is closed. MarketPilot sets it a multiple of ATR away so it
+  adapts to how volatile a market is. A **trailing stop** moves up behind the best price to lock in profit.
+- **Walk-forward testing** — choose a strategy's settings on older data, then test on later data it has never
+  seen. A final untouched **holdout** period is checked once at the end.
+- **t-statistic** — how many standard errors the average result is above zero. Below ~2, the result could
+  easily be luck.
+- **Survivorship bias** — testing only on today's winners (e.g. NVDA) makes any strategy look better than it
+  would have been. That's why MarketPilot uses broad ETFs.
+- **Costs** — spreads, slippage and fees are charged on every simulated trade. Many strategies that look good
+  before costs lose money after them.""")
+    st.markdown("### Technical indicators")
+    INDICATORS = {
+        "Moving average (SMA / EMA)": "The average price over the last N bars. SMA weights all bars equally; EMA "
+            "weights recent bars more. Price above its 200-day average is the classic sign of a long-term uptrend.",
+        "RSI (Relative Strength Index)": "0–100 scale of recent gains vs losses. RSI(2) below 10 means two sharp "
+            "down days — very oversold. RSI(14) is the common slower version.",
+        "ATR (Average True Range)": "The average size of a bar's move, including gaps. Used to set stops and size "
+            "positions so a volatile market gets a wider stop and a smaller position.",
+        "Bollinger Bands": "A 20-day average with bands 2 standard deviations above and below. A close outside "
+            "the bands is unusually stretched.",
+        "MACD": "The 12-day EMA minus the 26-day EMA, plus a 9-day 'signal' average of that. MACD crossing above "
+            "its signal line means short-term momentum has turned up.",
+        "Donchian channel": "The highest high and lowest low of the last N bars (20 or 55). Breaking out of it "
+            "is the basis of the famous Turtle trading rules.",
+        "52-week high": "The highest price of the past year. Research (George & Hwang 2004) found stocks near "
+            "52-week highs tend to keep outperforming.",
+        "Efficiency ratio / regime": "How straight the path of price has been (1 = straight line, 0 = noise). "
+            "MarketPilot labels each market trending, ranging or volatile from this and ATR.",
+    }
+    for k, v in INDICATORS.items():
+        with st.expander(k):
+            st.write(v)
+    st.markdown("### Strategies")
+    from marketpilot.strategies import ALL_STRATEGIES
+    for cls in ALL_STRATEGIES:
+        with st.expander(f"{cls.name}  ·  {cls.family}"):
+            st.write((cls.__doc__ or "").strip())
+            st.caption("Settings tested by research: " + ", ".join(f"{k} ∈ {v}" for k, v in cls.grid.items()))
+    st.info("Educational information about how the bots work — not financial advice.")
