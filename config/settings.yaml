@@ -93,6 +93,17 @@ news:
   llm_enabled: false             # needs ANTHROPIC_API_KEY; veto-only, never a buy signal
   llm_model: claude-haiku-5-5
 
+# Learning Lab (v0.7): shadow bots practice-trade EVERY strategy on EVERY market
+# (results in R, no position limits, never touches the real paper account).
+# The Learning bot promotes/demotes strategies per market group from that evidence.
+learning:
+  enabled: true
+  promote_min_trades: 50          # forward shadow trades needed before promotion
+  promote_min_expectancy_r: 0.10
+  promote_min_tstat: 2.0
+  demote_min_trades: 30
+  demote_below_expectancy_r: 0.0
+
 notifications:                   # phone push via ntfy; set the NTFY_TOPIC secret to enable
   daily_summary_hour_utc: 21
 
