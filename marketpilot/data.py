@@ -27,11 +27,18 @@ def drop_incomplete(df: pd.DataFrame, interval: str, now: datetime) -> pd.DataFr
 
 
 def quote_currency(symbol: str, asset_class: str) -> str:
+    """Currency a symbol is priced in. London-listed (.L) ETFs are quoted in pence (GBp)."""
     if asset_class == "forex":
         return symbol.replace("=X", "")[3:6]
     if asset_class == "crypto":
         return symbol.split("-")[-1]
+    if symbol.endswith(".L"):
+        return "GBp"
     return "USD"
+
+
+FX_FALLBACK = {"GBP": 1.0, "GBp": 0.01, "USD": 0.79, "EUR": 0.85, "JPY": 0.0052, "CHF": 0.90,
+               "CAD": 0.56, "AUD": 0.51, "NZD": 0.46}
 
 
 class DataProvider:
@@ -42,18 +49,20 @@ class DataProvider:
 
     def fx_to_gbp(self, currency: str, now: datetime) -> float:
         """Multiply an amount in `currency` by this to get GBP."""
-        if currency == "GBP":
-            return 1.0
-        pair = {"USD": "GBPUSD=X", "EUR": "EURGBP=X", "JPY": "GBPJPY=X"}.get(currency)
-        fallback = {"USD": 0.79, "EUR": 0.85, "JPY": 0.0052}.get(currency, 1.0)
-        if pair is None:
-            return fallback
+        if currency in ("GBP", "GBp"):
+            return FX_FALLBACK[currency]
+        fallback = FX_FALLBACK.get(currency)
+        pair = f"GBP{currency}=X"          # GBP per 1 unit of `currency` = 1 / (GBPxxx rate)
         try:
             df = self.history(pair, "1d", now - timedelta(days=10), now)
             px = float(df["close"].iloc[-1])
-            return px if pair.startswith(currency) else 1.0 / px
+            if px > 0:
+                return 1.0 / px
         except Exception:
-            return fallback
+            pass
+        if fallback is None:
+            raise RuntimeError(f"no GBP conversion for {currency}")
+        return fallback
 
 
 class YFinanceProvider(DataProvider):
@@ -139,7 +148,7 @@ class SyntheticProvider(DataProvider):
         return drop_incomplete(df, interval, end)
 
     def fx_to_gbp(self, currency, now):
-        return {"GBP": 1.0, "USD": 0.79, "EUR": 0.85, "JPY": 0.0052}.get(currency, 1.0)
+        return FX_FALLBACK[currency]
 
 
 def make_provider(name: str) -> DataProvider:
