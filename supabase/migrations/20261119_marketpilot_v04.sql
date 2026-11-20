@@ -104,3 +104,8 @@ alter table mp_strategies enable row level security;
 alter table mp_equity     enable row level security;
 alter table mp_events     enable row level security;
 alter table mp_control    enable row level security;
+
+-- Newer Supabase projects don't auto-grant SQL-Editor tables to service_role.
+grant usage on schema public to service_role;
+grant select, insert, update, delete on mp_candidates, mp_trades, mp_strategies, mp_equity, mp_events, mp_control to service_role;
+grant usage, select on all sequences in schema public to service_role;
