@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -390,3 +391,67 @@ def test_every_market_group_has_costs_and_valid_filter(settings):
     for cls, spec in settings.raw["market_filter"].items():
         assert spec["symbol"] in settings.all_symbols()
     assert len(settings.all_symbols()) == len(set(settings.all_symbols()))
+
+
+# ---------------- v0.7 Learning Lab ----------------
+
+def test_new_strategies_registered_and_roundtrip():
+    from marketpilot.strategies import ALL_STRATEGIES
+    names = {c.name for c in ALL_STRATEGIES}
+    assert {"bollinger_reversion", "turtle_55", "macd_trend", "high_52week"} <= names
+    for c in ALL_STRATEGIES:
+        for v in c.variants():
+            assert strategy_from_key(v.key).key == v.key
+
+
+def test_new_strategies_trade_in_backtest():
+    from marketpilot.strategies import BollingerReversion, High52Week, MACDTrend, Turtle55
+    df = SyntheticProvider().history("SPY", "1d", datetime(2018, 1, 1, tzinfo=UTC), datetime(2026, 6, 1, tzinfo=UTC))
+    ind = add_indicators(df)
+    for cls in (BollingerReversion, Turtle55, MACDTrend, High52Week):
+        trades = run_backtest(ind, cls(), CostModel(2, 3), allow_short=False)
+        assert trades, cls.name
+        assert all(np.isfinite(t.r_multiple) for t in trades)
+
+
+def test_shadow_bots_trade_every_strategy_without_touching_real_account(small_settings, store):
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    t = datetime(2025, 6, 2, 0, 7, tzinfo=UTC)
+    for d in range(150):
+        eng.cycle(t + timedelta(days=d))
+    shadow = store.shadow_trades()
+    assert len(shadow) > 10
+    assert len({s["strategy"].split("(")[0] for s in shadow}) >= 4   # many strategies practising
+    assert store.trades() == []                                       # nothing approved -> no real trades
+    closed = [s for s in shadow if s["status"] == "closed"]
+    assert closed and all(np.isfinite(float(s["r_multiple"])) for s in closed)
+    # one open shadow position per symbol x strategy at a time
+    active = [(s["symbol"], s["strategy"].split("(")[0]) for s in shadow if s["status"] in ("open", "pending")]
+    assert len(active) == len(set(active))
+
+
+def test_forward_verdict_promotes_and_demotes(settings):
+    from marketpilot.bots.learning import forward_verdict
+    cfg = settings["learning"]
+    good = pd.DataFrame([{"asset_class": "forex", "strategy": "turtle_55", "trades": 80,
+                          "expectancy_r": 0.3, "t_stat": 2.6, "win_rate": 0.4}])
+    bad = pd.DataFrame([{"asset_class": "stocks", "strategy": "trend_ema", "trades": 40,
+                         "expectancy_r": -0.2, "t_stat": -1.5, "win_rate": 0.3}])
+    thin = pd.DataFrame([{"asset_class": "forex", "strategy": "turtle_55", "trades": 12,
+                          "expectancy_r": 0.9, "t_stat": 3.0, "win_rate": 0.7}])
+    assert forward_verdict(good, "forex", "turtle_55", cfg)[0] == "promote"
+    assert forward_verdict(bad, "stocks", "trend_ema", cfg)[0] == "demote"
+    assert forward_verdict(thin, "forex", "turtle_55", cfg)[0] is None
+
+
+def test_apply_learning_updates_strategy_status(settings, store):
+    from marketpilot.bots.learning import apply_learning
+    store.save_strategy({"strategy_id": "EURUSD=X|turtle_55", "symbol": "EURUSD=X", "asset_class": "forex",
+                         "strategy": "turtle_55", "family": "breakout", "params": "turtle_55(stop=2,trail=3)",
+                         "status": "rejected", "reasons": ["t-stat"], "oos": {"expectancy_r": 0.1}, "holdout": {}})
+    for i in range(60):
+        store.open_shadow({"trade_id": f"s{i}", "candidate_id": f"c{i}", "symbol": "EURUSD=X",
+                           "asset_class": "forex", "strategy": "turtle_55(stop=2,trail=3)", "status": "closed",
+                           "opened_at": f"2026-01-{i % 28 + 1:02d}", "r_multiple": 2.0 if i % 2 else -0.6})
+    msgs = apply_learning(store, settings)
+    assert msgs and store.strategies("approved")[0]["strategy"] == "turtle_55"
