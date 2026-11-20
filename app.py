@@ -1,299 +1,272 @@
+"""MarketPilot v0.4 dashboard (Streamlit).
+
+The bots run in the scheduled worker (GitHub Actions); this app only reads the
+results and lets you flip the kill switch or trigger a cycle manually.
+"""
 import hmac
-import math
-from datetime import datetime, timezone
+import os
 
-import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
-from supabase import create_client
 
-st.set_page_config(page_title='MarketPilot v0.3', page_icon='📈', layout='wide')
+st.set_page_config(page_title="MarketPilot v0.4", page_icon="📈", layout="wide")
 
-UNIVERSE = {
-    'Forex': ['GBPUSD=X', 'EURUSD=X', 'USDJPY=X'],
-    'Crypto': ['BTC-USD', 'ETH-USD'],
-    'Stocks & ETFs': ['AAPL', 'MSFT', 'NVDA', 'SPY', 'VUAG.L'],
-}
+BLUE, ORANGE, GOOD, CRITICAL, MUTED, GRID = "#2a78d6", "#eb6834", "#0ca30c", "#d03b3b", "#898781", "#e1e0d9"
+
+
+def _secret(name):
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
 
 
 def authenticate():
-    password = st.secrets.get('APP_PASSWORD', '')
+    password = _secret("APP_PASSWORD") or ""
     if not password:
-        st.warning('Access password is not configured. Keep the app private and add APP_PASSWORD in Streamlit Secrets before sharing its URL.')
+        st.warning("APP_PASSWORD is not set in Streamlit Secrets — keep this app private.")
         return
-    if st.session_state.get('authenticated'):
+    if st.session_state.get("authenticated"):
         return
-    st.title('🔒 MarketPilot sign in')
-    with st.form('login'):
-        attempt = st.text_input('App password', type='password')
-        submitted = st.form_submit_button('Unlock')
-    if submitted:
+    st.title("🔒 MarketPilot sign in")
+    with st.form("login"):
+        attempt = st.text_input("App password", type="password")
+        ok = st.form_submit_button("Unlock")
+    if ok:
         if hmac.compare_digest(attempt, str(password)):
-            st.session_state['authenticated'] = True
+            st.session_state["authenticated"] = True
             st.rerun()
-        else:
-            st.error('Incorrect password')
+        st.error("Incorrect password")
     st.stop()
+
+
+@st.cache_resource
+def get_store():
+    from marketpilot.storage import make_store
+    url = _secret("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+    key = _secret("SUPABASE_SERVICE_KEY") or _secret("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+    if url and key:
+        os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"] = url, key
+        return make_store("supabase"), "Supabase"
+    return make_store(os.environ.get("MARKETPILOT_DB")), "local SQLite (demo)"
+
+
+def style(fig, height=320, y_title=None, pct=False, legend=False):
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=30, b=10), plot_bgcolor="rgba(0,0,0,0)",
+                      paper_bgcolor="rgba(0,0,0,0)", hovermode="closest", showlegend=legend,
+                      legend=dict(orientation="h", y=1.12, x=0))
+    fig.update_xaxes(showgrid=False, linecolor=GRID)
+    fig.update_yaxes(gridcolor=GRID, zerolinecolor=MUTED, title=y_title, tickformat=".0%" if pct else None)
+    return fig
 
 
 authenticate()
-st.title('📈 MarketPilot')
-st.caption('Version 0.3 • Research scanner, risk controls and Supabase paper trading')
-st.warning('Paper trading only. Scores are heuristic rankings, not success probabilities. No live orders or broker integration.')
+from marketpilot.bots.performance import report  # noqa: E402
+from marketpilot.config import load_settings  # noqa: E402
 
-try:
-    db = create_client(st.secrets['SUPABASE_URL'], st.secrets['SUPABASE_KEY'])
-except Exception:
-    st.error('Supabase connection could not be configured. Check the existing SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets. Never share them.')
-    st.stop()
+settings = load_settings()
+store, backend = get_store()
+start_bal = settings.account["starting_balance"]
+target_wr = settings["goals"]["target_win_rate"]
 
+st.title("📈 MarketPilot v0.4 — multi-agent paper trading")
+kill = store.get_control("kill_switch", "off") == "on"
+c1, c2 = st.columns([3, 1])
+c1.caption(f"Storage: {backend} • Paper trading only — no live orders, no broker connection. Not financial advice.")
+if kill:
+    c2.error("⛔ Kill switch ON")
+else:
+    c2.success("✅ Trading active (paper)")
 
-def err(exc):
-    # Avoid printing raw provider errors that might contain sensitive information.
-    st.error(f'Database operation failed ({type(exc).__name__}). Check Supabase table permissions and Streamlit logs. Do not share credentials.')
+trades = store.trades()
+rep = report(trades, start_bal)
+o = rep["overall"]
+closed = rep["closed"]
 
+tabs = st.tabs(["Overview", "Bot decisions", "Strategies", "Positions", "Trade log", "Bot activity", "Controls"])
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load(symbol, period='1y', interval='1d'):
-    frame = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
-    if frame is None or frame.empty:
-        return pd.DataFrame()
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-    frame.columns = [str(x).title() for x in frame.columns]
-    return frame.dropna(subset=['Close']) if 'Close' in frame else pd.DataFrame()
+# ---------------- Overview ----------------
+with tabs[0]:
+    m = st.columns(7)
+    m[0].metric("Closed trades", o["trades"], help="Wins / losses")
+    m[1].metric("Win rate", f"{o['win_rate']:.1%}", f"{(o['win_rate'] - target_wr) * 100:+.1f} pts vs {target_wr:.0%} goal",
+                delta_color="normal")
+    m[2].metric("Win : loss", f"{o['wins']} : {o['losses']}", help=f"Win/loss ratio {o['win_loss_ratio']:.2f}")
+    m[3].metric("Expectancy", f"{o['expectancy_r']:+.3f}R", help="Average result per trade in R (1R = £ risked)")
+    m[4].metric("Profit factor", f"{o['profit_factor']:.2f}" if o["trades"] else "—")
+    m[5].metric("P&L", f"£{o['pnl_gbp']:+,.2f}", f"{o['return_pct']:+.2f}%")
+    m[6].metric("Max drawdown", f"{o['max_drawdown_r']:.1f}R")
 
+    if o["trades"]:
+        st.caption(f"Win rate 95% range with {o['trades']} trades: {o['win_rate_lo']:.0%} – {o['win_rate_hi']:.0%}. "
+                   "Narrow this with more trades before trusting it.")
+    with st.expander("Why win rate isn't the whole story", expanded=o["trades"] == 0):
+        st.markdown(
+            "Any system can hit a 70–80% win rate by using a tiny take-profit and a wide stop — and still lose money, "
+            "because the rare losses are big. MarketPilot **tracks win rate against your goal** but only approves "
+            "strategies with positive **expectancy after costs** on unseen data. "
+            "Expectancy = win rate × average win − loss rate × average loss (in R, where 1R = the £ risked).")
 
-def calculate(frame):
-    x = frame.copy()
-    close = x['Close'].astype(float)
-    x['EMA20'] = close.ewm(span=20, adjust=False).mean()
-    x['EMA50'] = close.ewm(span=50, adjust=False).mean()
-    delta = close.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rs = up / down.replace(0, np.nan)
-    x['RSI14'] = (100 - 100 / (1 + rs)).fillna(50)
-    high = x['High'].astype(float) if 'High' in x else close
-    low = x['Low'].astype(float) if 'Low' in x else close
-    prev = close.shift(1)
-    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
-    x['ATR14'] = tr.rolling(14).mean()
-    return x
+    eq = pd.DataFrame(store.equity_curve())
+    if not eq.empty:
+        eq["ts"] = pd.to_datetime(eq["ts"], utc=True, format="mixed")
+        fig = go.Figure(go.Scatter(x=eq["ts"], y=eq["equity_gbp"], name="Equity (£)",
+                                   line=dict(color=BLUE, width=2), hovertemplate="£%{y:,.2f}<extra></extra>"))
+        fig.add_hline(y=start_bal, line=dict(color=MUTED, dash="dot", width=1),
+                      annotation_text=f"start £{start_bal:,.0f}", annotation_font_color=MUTED)
+        st.subheader("Paper account equity")
+        st.plotly_chart(style(fig, y_title="£"), width="stretch")
 
+    if not closed.empty:
+        cl = closed.reset_index(drop=True)
+        cl["n"] = cl.index + 1
+        w = min(20, len(cl))
+        cl["rolling_wr"] = (cl["r_multiple"] > 0).rolling(w, min_periods=1).mean()
+        cl["cum_wr"] = (cl["r_multiple"] > 0).expanding().mean()
+        a, b = st.columns(2)
+        with a:
+            st.subheader("Win rate vs goal")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=cl["n"], y=cl["cum_wr"], name="All trades", line=dict(color=BLUE, width=2)))
+            fig.add_trace(go.Scatter(x=cl["n"], y=cl["rolling_wr"], name=f"Last {w} trades",
+                                     line=dict(color=ORANGE, width=2)))
+            fig.add_hline(y=target_wr, line=dict(color=MUTED, dash="dash", width=1),
+                          annotation_text=f"goal {target_wr:.0%}", annotation_font_color=MUTED)
+            fig.update_xaxes(title="trade #")
+            st.plotly_chart(style(fig, pct=True, legend=True), width="stretch")
+        with b:
+            st.subheader("Result per trade (R)")
+            colors = [GOOD if r > 0 else CRITICAL for r in cl["r_multiple"]]
+            fig = go.Figure(go.Bar(x=cl["n"], y=cl["r_multiple"], marker_color=colors, name="R per trade",
+                                   customdata=cl[["symbol", "strategy", "exit_reason"]],
+                                   hovertemplate="%{customdata[0]} %{y:+.2f}R<br>%{customdata[1]}<br>%{customdata[2]}<extra></extra>"))
+            fig.update_xaxes(title="trade #")
+            st.plotly_chart(style(fig, y_title="R"), width="stretch")
 
-def setup(symbol, market, frame):
-    if len(frame) < 55:
-        return None
-    x = calculate(frame)
-    row = x.iloc[-1]
-    if not np.isfinite(row['ATR14']) or row['ATR14'] <= 0:
-        return None
-    price, ema20, ema50, rsi, atr = (float(row[k]) for k in ['Close', 'EMA20', 'EMA50', 'RSI14', 'ATR14'])
-    if ema20 > ema50 and price > ema20:
-        direction = 'Long'
-    elif ema20 < ema50 and price < ema20:
-        direction = 'Short'
+        st.subheader("Breakdown")
+        dim = st.radio("By", ["strategy", "asset_class", "symbol", "regime"], horizontal=True)
+        bd = rep["by"][dim]
+        if not bd.empty:
+            bd = bd.sort_values("expectancy_r")
+            show = bd[[dim, "trades", "win_rate", "expectancy_r", "profit_factor", "total_r", "pnl_gbp", "max_drawdown_r"]]
+            st.dataframe(show.style.format({"win_rate": "{:.0%}", "expectancy_r": "{:+.3f}", "profit_factor": "{:.2f}",
+                                            "total_r": "{:+.2f}", "pnl_gbp": "£{:+.2f}", "max_drawdown_r": "{:.2f}"}),
+                         hide_index=True, width="stretch")
     else:
-        direction = 'Watch'
-    # Transparent 0–100 *ranking*, not an estimated win probability.
-    trend = 30 if direction != 'Watch' else 0
-    momentum = 25 if (direction == 'Long' and 50 <= rsi <= 68) or (direction == 'Short' and 32 <= rsi <= 50) else 10
-    slope = 20 if (direction == 'Long' and price > float(x['Close'].iloc[-2])) or (direction == 'Short' and price < float(x['Close'].iloc[-2])) else 0
-    volatility = 15 if 0.002 <= atr / price <= 0.08 else 5
-    data_quality = 10 if len(frame) >= 100 else 5
-    score = trend + momentum + slope + volatility + data_quality
-    stop = price - 2 * atr if direction == 'Long' else price + 2 * atr if direction == 'Short' else np.nan
-    target = price + 3 * atr if direction == 'Long' else price - 3 * atr if direction == 'Short' else np.nan
-    return {'Market': market, 'Symbol': symbol, 'Setup': direction, 'Ranking / 100': score,
-            'Last price': price, 'RSI14': rsi, 'ATR14': atr, 'Stop (illustrative)': stop,
-            'Target (illustrative)': target, 'Data time': str(x.index[-1])}
+        st.info("No closed paper trades yet. The worker trades only strategies that passed backtesting — "
+                "check the Strategies tab, and give it time: daily-bar strategies may trade a few times a month.")
 
+# ---------------- Bot decisions ----------------
+with tabs[1]:
+    st.subheader("Every candidate trade and why it was taken or rejected")
+    cand = pd.DataFrame(store.candidates(1000))
+    if cand.empty:
+        st.info("No candidates yet.")
+    else:
+        f = st.selectbox("Show", ["all", "trade", "reject"])
+        if f != "all":
+            cand = cand[cand["decision"] == f]
+        cand["why"] = cand["reasons"].apply(lambda r: "; ".join(r) if isinstance(r, list) and r else "all checks passed")
+        cand["side"] = cand["direction"].map({1: "LONG", -1: "SHORT"})
+        st.dataframe(cand[["bar_time", "symbol", "side", "strategy", "regime", "decision", "expected_r", "why"]],
+                     hide_index=True, width="stretch",
+                     column_config={"expected_r": st.column_config.NumberColumn("EV (R)", format="%+.3f")})
 
-def trades(status=None):
-    q = db.table('trades').select('*').order('opened_at', desc=True)
-    if status:
-        q = q.eq('status', status)
-    return q.execute().data or []
+# ---------------- Strategies ----------------
+with tabs[2]:
+    st.subheader("Strategy research & backtesting results")
+    st.caption("Tested walk-forward on unseen data with fees, spreads and slippage, pooled per market, then checked "
+               "once on an untouched holdout. Only APPROVED strategies trade.")
+    strat = pd.DataFrame(store.strategies())
+    if strat.empty:
+        st.info("No research yet — run `python -m marketpilot research` or the GitHub Action.")
+    else:
+        g = strat.drop_duplicates(["asset_class", "strategy"]).copy()
+        g["OOS trades"] = g["oos"].apply(lambda x: x["trades"])
+        g["OOS win rate"] = g["oos"].apply(lambda x: x["win_rate"])
+        g["OOS expectancy R"] = g["oos"].apply(lambda x: x["expectancy_r"])
+        g["OOS profit factor"] = g["oos"].apply(lambda x: x["profit_factor"])
+        g["Holdout expectancy R"] = g["holdout"].apply(lambda x: x["expectancy_r"])
+        g["Why"] = g["reasons"].apply(lambda r: "; ".join(r) if r else "passed all gates")
+        st.dataframe(g[["asset_class", "strategy", "status", "OOS trades", "OOS win rate", "OOS expectancy R",
+                        "OOS profit factor", "Holdout expectancy R", "Why"]].style.format(
+            {"OOS win rate": "{:.0%}", "OOS expectancy R": "{:+.3f}", "OOS profit factor": "{:.2f}",
+             "Holdout expectancy R": "{:+.3f}"}), hide_index=True, width="stretch")
+        fig = go.Figure(go.Scatter(
+            x=g["OOS win rate"], y=g["OOS expectancy R"], mode="markers+text", text=g["strategy"] + " · " + g["asset_class"],
+            textposition="top center", textfont=dict(size=10, color=MUTED),
+            marker=dict(size=11, color=[BLUE if s == "approved" else MUTED for s in g["status"]],
+                        line=dict(color="#fcfcfb", width=2)),
+            hovertemplate="%{text}<br>win %{x:.0%} · %{y:+.3f}R<extra></extra>", name="strategy"))
+        fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+        fig.add_vline(x=target_wr, line=dict(color=MUTED, dash="dash", width=1), annotation_text="win-rate goal")
+        fig.update_xaxes(title="out-of-sample win rate", tickformat=".0%")
+        st.markdown("**Win rate vs. expectancy** — blue = approved, grey = rejected. High win rate ≠ profitable.")
+        st.plotly_chart(style(fig, 380, "expectancy (R per trade)"), width="stretch")
 
+# ---------------- Positions ----------------
+with tabs[3]:
+    st.subheader("Open & pending paper positions")
+    op = pd.DataFrame([t for t in trades if t["status"] in ("open", "pending")])
+    if op.empty:
+        st.info("No open positions.")
+    else:
+        op["side"] = op["direction"].map({1: "LONG", -1: "SHORT"})
+        st.dataframe(op[["symbol", "side", "status", "strategy", "opened_at", "entry_price", "stop", "target",
+                         "quantity", "risk_gbp", "notional_gbp", "bars_held"]], hide_index=True, width="stretch")
 
-def pnl(trade):
-    if trade.get('status') != 'Closed' or trade.get('exit_price') is None:
-        return np.nan
-    difference = float(trade['exit_price']) - float(trade['entry_price'])
-    if trade['direction'] == 'Short':
-        difference *= -1
-    return difference * float(trade['quantity']) - float(trade.get('fees') or 0) - float(trade.get('slippage') or 0)
+# ---------------- Trade log ----------------
+with tabs[4]:
+    st.subheader("Closed paper trades")
+    if closed.empty:
+        st.info("No closed trades yet.")
+    else:
+        log = closed.sort_values("closed_at", ascending=False).copy()
+        log["result"] = log["r_multiple"].apply(lambda r: "WIN" if r > 0 else "LOSS")
+        log["side"] = log["direction"].map({1: "LONG", -1: "SHORT"})
+        cols = ["closed_at", "symbol", "side", "strategy", "result", "r_multiple", "pnl_gbp", "fees_gbp",
+                "entry_price", "exit_price", "exit_reason", "regime"]
+        st.dataframe(log[cols], hide_index=True, width="stretch",
+                     column_config={"r_multiple": st.column_config.NumberColumn("R", format="%+.2f"),
+                                    "pnl_gbp": st.column_config.NumberColumn("P&L £", format="%+.2f")})
+        st.download_button("Download trade log CSV", log[cols].to_csv(index=False), "marketpilot_trades.csv")
 
+# ---------------- Bot activity ----------------
+with tabs[5]:
+    ev = pd.DataFrame(store.events(500))
+    if ev.empty:
+        st.info("No activity yet.")
+    else:
+        st.dataframe(ev[["ts", "level", "bot", "message"]], hide_index=True, width="stretch")
 
-with st.sidebar:
-    st.header('Research settings')
-    period = st.selectbox('History', ['6mo', '1y', '2y', '5y'], index=1)
-    interval = st.selectbox('Interval', ['1d', '1h'])
-    balance = st.number_input('Reference balance (£)', min_value=50.0, value=500.0, step=50.0)
-    risk_pct = st.slider('Risk budget per trade (%)', 0.1, 2.0, 0.5, 0.1)
-    st.caption('Daily candles are recommended. Intraday history is limited by the data provider.')
-    if st.session_state.get('authenticated') and st.button('Sign out'):
-        st.session_state['authenticated'] = False
+# ---------------- Controls ----------------
+with tabs[6]:
+    from marketpilot.bots.safety import SafetyBot
+    safety = SafetyBot(store, settings)
+    st.subheader("Kill switch")
+    st.caption("ON = no new trades. Open positions keep their stops and targets managed.")
+    if kill:
+        st.write(f"Reason: {store.get_control('pause_reason', '') or 'manual'}")
+        if st.button("Release kill switch", type="primary"):
+            safety.release()
+            st.rerun()
+    elif st.button("⛔ Engage kill switch", type="primary"):
+        safety.engage("manual kill switch from dashboard")
         st.rerun()
-
-t1, t2, t3, t4, t5, t6 = st.tabs(['Scanner', 'Risk calculator', 'Open paper trade', 'Positions', 'Performance', 'Journal'])
-
-with t1:
-    st.subheader('Ranked market opportunities')
-    if st.button('Scan markets', type='primary'):
-        rows, missed = [], []
-        with st.spinner('Downloading market data…'):
-            for market, symbols in UNIVERSE.items():
-                for symbol in symbols:
-                    try:
-                        result = setup(symbol, market, load(symbol, period, interval))
-                        if result:
-                            rows.append(result)
-                        else:
-                            missed.append(symbol)
-                    except Exception:
-                        missed.append(symbol)
-        st.session_state['scan'] = pd.DataFrame(rows).sort_values('Ranking / 100', ascending=False) if rows else pd.DataFrame()
-        st.session_state['scan_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        if missed:
-            st.info('No usable data for: ' + ', '.join(missed))
-    if 'scan' in st.session_state:
-        data = st.session_state['scan']
-        st.caption('Last scan: ' + st.session_state.get('scan_at', ''))
-        if data.empty:
-            st.info('No usable market data returned. Try daily interval or another history range.')
-        else:
-            st.dataframe(data, width='stretch', hide_index=True)
-            st.download_button('Download scan CSV', data.to_csv(index=False), 'marketpilot_scan.csv', 'text/csv')
-            selected = st.selectbox('Chart symbol', data['Symbol'].tolist())
-            chart = calculate(load(selected, period, interval))
-            if not chart.empty:
-                st.line_chart(chart[['Close', 'EMA20', 'EMA50']], width='stretch')
-    st.caption('Ranking: trend 30, momentum up to 25, recent price direction 20, volatility up to 15, data length up to 10. Rankings are not calibrated probabilities.')
-
-with t2:
-    st.subheader('Illustrative risk calculator')
-    st.caption('Assumes price and account currency are the same and one unit has a multiplier of 1. Not suitable for forex lots, derivatives or non-GBP instruments without conversion.')
-    entry = st.number_input('Entry price', min_value=0.00000001, value=100.0, format='%.8f', key='risk_entry')
-    stop = st.number_input('Stop price', min_value=0.00000001, value=95.0, format='%.8f', key='risk_stop')
-    target = st.number_input('Target price', min_value=0.00000001, value=110.0, format='%.8f', key='risk_target')
-    distance = abs(entry - stop)
-    budget = balance * risk_pct / 100
-    units = budget / distance if distance else 0
-    reward = abs(target - entry)
-    st.metric('Risk budget (£)', f'£{budget:,.2f}')
-    st.metric('Illustrative quantity', f'{units:,.4f}' if distance else '—')
-    st.metric('Reward / risk', f'{reward / distance:.2f}:1' if distance else '—')
-    if distance == 0:
-        st.error('Entry and stop must be different.')
-    if not ((stop < entry < target) or (target < entry < stop)):
-        st.warning('Stop and target should be on opposite sides of entry.')
-    st.info('For USD stocks and FX, do not interpret this quantity or £ amount as executable until currency conversion, lot size and contract multiplier are handled.')
-
-with t3:
-    st.subheader('Record a simulated trade')
-    with st.form('new_trade'):
-        c1, c2 = st.columns(2)
-        asset = c1.text_input('Ticker', placeholder='AAPL')
-        asset_class = c2.selectbox('Market', ['Forex', 'Crypto', 'Stocks & ETFs', 'Other'])
-        direction = c1.selectbox('Direction', ['Long', 'Short'])
-        entry_price = c2.number_input('Entry price', min_value=0.00000001, value=100.0, format='%.8f')
-        quantity = c1.number_input('Units', min_value=0.00000001, value=1.0, format='%.8f')
-        stop_loss = c2.number_input('Stop (0 = none)', min_value=0.0, value=0.0, format='%.8f')
-        take_profit = c1.number_input('Target (0 = none)', min_value=0.0, value=0.0, format='%.8f')
-        fees = c2.number_input('Fees (illustrative £)', min_value=0.0, value=0.0)
-        slippage = c1.number_input('Slippage (illustrative £)', min_value=0.0, value=0.0)
-        notes = st.text_area('Reason / notes')
-        submit = st.form_submit_button('Save paper trade')
-    if submit:
-        invalid_stop = stop_loss > 0 and ((direction == 'Long' and stop_loss >= entry_price) or (direction == 'Short' and stop_loss <= entry_price))
-        invalid_target = take_profit > 0 and ((direction == 'Long' and take_profit <= entry_price) or (direction == 'Short' and take_profit >= entry_price))
-        if not asset.strip() or invalid_stop or invalid_target:
-            st.error('Check ticker and stop/target direction before saving.')
-        else:
-            row = {'asset': asset.strip().upper(), 'asset_class': asset_class, 'direction': direction,
-                   'entry_price': float(entry_price), 'quantity': float(quantity),
-                   'stop_loss': float(stop_loss) if stop_loss else None,
-                   'take_profit': float(take_profit) if take_profit else None,
-                   'fees': float(fees), 'slippage': float(slippage), 'status': 'Open',
-                   'notes': notes.strip() or None, 'opened_at': datetime.now(timezone.utc).isoformat()}
-            try:
-                db.table('trades').insert(row).execute()
-                st.success('Saved simulated trade to Supabase.')
-            except Exception as exc:
-                err(exc)
-
-with t4:
-    st.subheader('Open paper positions')
-    try:
-        active = trades('Open')
-        if not active:
-            st.info('No open positions.')
-        else:
-            st.dataframe(pd.DataFrame(active), width='stretch', hide_index=True)
-            options = {f"{str(x['id'])[:8]} • {x['asset']} • {x['direction']}": x for x in active}
-            selected = st.selectbox('Position to close', list(options))
-            chosen = options[selected]
-            with st.form('close_position'):
-                exit_price = st.number_input('Exit price', min_value=0.00000001, value=float(chosen['entry_price']), format='%.8f')
-                closing_fees = st.number_input('Additional fees (£)', min_value=0.0, value=0.0)
-                exit_reason = st.text_area('Exit reason')
-                lessons = st.text_area('Lessons learned')
-                closing = st.form_submit_button('Close simulated position')
-            if closing:
-                try:
-                    # Existing schema uses two separate writes; a failed journal insert may leave a closed trade.
-                    db.table('trades').update({'exit_price': float(exit_price), 'fees': float(chosen.get('fees') or 0) + float(closing_fees), 'status': 'Closed', 'closed_at': datetime.now(timezone.utc).isoformat()}).eq('id', chosen['id']).execute()
-                    try:
-                        db.table('trade_journal').insert({'trade_id': chosen['id'], 'entry_reason': chosen.get('notes'), 'exit_reason': exit_reason.strip() or None, 'lessons_learned': lessons.strip() or None}).execute()
-                        st.success('Position closed and journal saved.')
-                    except Exception as exc:
-                        st.warning('Position closed, but journal could not be saved. Check the database before retrying.')
-                        err(exc)
-                except Exception as exc:
-                    err(exc)
-    except Exception as exc:
-        err(exc)
-
-with t5:
-    st.subheader('Paper-trading performance')
-    try:
-        history = pd.DataFrame(trades())
-        if history.empty:
-            st.info('No trades recorded.')
-        else:
-            history['Indicative P/L'] = history.apply(pnl, axis=1)
-            closed = history[history['status'] == 'Closed'].copy()
-            if not closed.empty:
-                values = closed['Indicative P/L'].fillna(0)
-                equity = values.iloc[::-1].cumsum()
-                drawdown = (equity - equity.cummax()).min()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric('Closed trades', len(closed))
-                c2.metric('Indicative P/L', f'{values.sum():,.2f} (native quote units*)')
-                c3.metric('Win rate', f'{(values > 0).mean() * 100:.1f}%')
-                c4.metric('Max realised drawdown*', f'{abs(drawdown):,.2f}')
-                st.line_chart(pd.DataFrame({'Cumulative indicative P/L': equity.to_numpy()}), width='stretch')
-            st.dataframe(history, width='stretch', hide_index=True)
-            st.download_button('Download trades CSV', history.to_csv(index=False), 'marketpilot_trades.csv', 'text/csv')
-            st.caption('* P/L is not GBP-normalised. For USD assets it is in USD before fees; mixed-currency totals and drawdown are NOT financially meaningful. No unrealised P/L is included.')
-    except Exception as exc:
-        err(exc)
-
-with t6:
-    st.subheader('Trade journal')
-    try:
-        journal = db.table('trade_journal').select('*').order('created_at', desc=True).execute().data or []
-        if journal:
-            data = pd.DataFrame(journal)
-            st.dataframe(data, width='stretch', hide_index=True)
-            st.download_button('Download journal CSV', data.to_csv(index=False), 'marketpilot_journal.csv', 'text/csv')
-        else:
-            st.info('No journal entries yet.')
-    except Exception as exc:
-        err(exc)
-
-st.divider()
-st.caption('Yahoo Finance data may be delayed or unavailable. This is a single-user research prototype; protect your Streamlit app and do not share the URL or API credentials. Not financial advice.')
+    st.divider()
+    st.subheader("Run the bots now")
+    st.caption("Normally the GitHub Actions worker does this every hour. Use this to test.")
+    if st.button("Run one trading cycle"):
+        from datetime import datetime, timezone
+        from marketpilot.data import make_provider
+        from marketpilot.engine import Engine
+        with st.spinner("Scanning markets…"):
+            s = Engine(settings, make_provider("yfinance"), store).cycle(datetime.now(timezone.utc))
+        st.success(f"Cycle done: {s}")
+    st.divider()
+    st.subheader("Risk settings (from config/settings.yaml)")
+    a = settings.account
+    st.write(f"Balance £{a['starting_balance']:,.0f} • risk {a['risk_per_trade_pct']}% per trade "
+             f"(£{a['starting_balance'] * a['risk_per_trade_pct'] / 100:.2f}) • daily loss limit {a['daily_loss_limit_pct']}% • "
+             f"max {a['max_open_positions']} positions • leverage {a['max_leverage']}x")

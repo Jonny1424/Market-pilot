@@ -1,0 +1,20 @@
+# High-impact economic events (UTC). The News & Economic Events Bot blocks NEW
+# trades in affected asset classes / currencies inside the window.
+# Keep this updated from an economic calendar (e.g. FOMC, NFP, CPI, BoE, ECB).
+# affects: asset classes (stocks, crypto, forex) and/or currency codes (USD, GBP, EUR, JPY)
+events:
+  - name: US CPI (example)
+    time: "2026-12-10T13:30:00Z"
+    window_minutes_before: 60
+    window_minutes_after: 120
+    affects: [USD, stocks, crypto]
+  - name: FOMC rate decision (example)
+    time: "2026-12-09T19:00:00Z"
+    window_minutes_before: 120
+    window_minutes_after: 180
+    affects: [USD, stocks, crypto]
+  - name: BoE rate decision (example)
+    time: "2026-12-17T12:00:00Z"
+    window_minutes_before: 60
+    window_minutes_after: 120
+    affects: [GBP]

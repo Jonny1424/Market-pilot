@@ -1,26 +1,117 @@
-# MarketPilot AI — Version 0.1
+# MarketPilot v0.4 — Multi-Agent AI Paper Trading
 
-A Streamlit multi-market research scanner for Forex, cryptocurrency and stocks/ETFs.
+A team of trading bots that research strategies, backtest them honestly, then
+**automatically open and close paper trades** across S&P 500 stocks/ETFs, crypto
+and forex — logging every decision, win and loss.
 
-## Features
-- Public historical market data via `yfinance`.
-- EMA20, EMA50, RSI14 and ATR14 indicators.
-- Transparent rule-based bullish, bearish and watch signals.
-- Illustrative ATR-based stop and target levels.
-- CSV export and a position-risk calculator.
+> **Paper trading only.** There is no broker connection and no code path that
+> places real orders. Live trading should only be considered after months of
+> forward-test evidence and a separate review of broker integration, security
+> and UK (FCA) rules. Not financial advice.
 
-## Deploy on Streamlit Community Cloud
-1. Upload `app.py`, `requirements.txt` and `README.md` to the root of your GitHub repository.
-2. In Streamlit Community Cloud, choose **Create app**.
-3. Select the GitHub repository and branch `main`.
-4. Set the app file path to `app.py`.
-5. Deploy.
+## The 10 bots
 
-No Supabase credentials are needed for v0.1. This version does not yet save trades to Supabase.
+| # | Bot | File | AI or code? |
+|---|-----|------|-------------|
+| 1 | Market Scanner | `marketpilot/bots/scanner.py` | code |
+| 2 | Strategy Research | `marketpilot/bots/research.py` | code |
+| 3 | News & Economic Events | `marketpilot/bots/news.py` | calendar + optional Claude (veto only) |
+| 4 | Market Regime | `marketpilot/bots/regime.py` | code |
+| 5 | Risk Manager | `marketpilot/bots/risk.py` | code |
+| 6 | Trade Decision (can abstain) | `marketpilot/bots/decision.py` | code |
+| 7 | Auto-Trading (paper) | `marketpilot/bots/autotrader.py` | code |
+| 8 | Performance Analyst | `marketpilot/bots/performance.py` | code |
+| 9 | Backtesting | `marketpilot/backtest.py` | code |
+| 10 | Monitoring & Safety | `marketpilot/bots/safety.py` | code |
 
-## Important limitations
-- Research prototype only; signals are rules-based, not AI predictions or financial advice.
-- No broker connection, order placement, leverage or real-money execution.
-- No persistent paper-trade ledger or trade journal yet.
-- `yfinance` is an unofficial interface to Yahoo Finance. Data can be delayed, incomplete, rate-limited or unavailable. Check applicable data terms and rights.
-- No strategy profitability is promised or established.
+The orchestrator is `marketpilot/engine.py`. Calculations, execution and risk
+limits are deterministic code; Claude is only used to screen news headlines
+(off by default).
+
+```
+Scanner ─► Regime ─► approved strategy signals ─► News veto ─► Trade Decision (EV after costs, may abstain)
+                                                                  │
+                                                         Risk Manager (size, limits, kill switch)
+                                                                  │
+                                                Paper order ─► Auto-Trader ─► Performance & Monitoring
+```
+
+## How strategies earn the right to trade
+
+1. **Walk-forward backtest** per symbol: parameters are chosen on past data only,
+   then tested on the next unseen period. Fees, spreads and slippage are charged;
+   orders fill at the next bar's open; gaps through stops fill at the worse price.
+2. Out-of-sample trades are **pooled across each market** (stocks, crypto, forex).
+3. **Approval gate** (in `config/settings.yaml`): ≥30 OOS trades, expectancy
+   ≥ +0.05R, profit factor ≥ 1.15, *and* non-negative on a final untouched holdout.
+4. Live paper results are blended in; strategies that go negative over 30+
+   forward trades are **retired** automatically.
+
+### About the 70–80% win-rate goal
+
+The dashboard tracks win rate against your goal (set in `goals.target_win_rate`).
+But the bots are deliberately **not** told to maximise win rate: a tiny take-profit
+with a wide stop wins 80% of the time and can still lose money. In testing, the
+mean-reversion strategy reached a 62–66% win rate and was *rejected* because it
+lost money on unseen data, while 36–41% win-rate trend strategies were approved
+because their average win is ~2× their average loss. The "Strategies" tab plots
+win rate against expectancy so you can see this for yourself.
+
+## Risk controls (defaults)
+
+£500 reference balance • 0.5% risk per trade (£2.50) • 2% daily loss limit •
+max 4 positions • no leverage (total notional ≤ equity) • trades rejected if costs
+exceed 35% of the risk • spot stocks/crypto long-only • auto kill switch if more
+than half the data feeds fail or equity falls 15% • manual kill switch in the
+dashboard and CLI. With the kill switch on, open positions keep their stops.
+
+## Setup
+
+### 1. Supabase
+Open your project → **SQL Editor** → paste `supabase/migrations/20261119_marketpilot_v04.sql` → **Run**.
+This adds `mp_*` tables and leaves your v0.3 `trades`/`trade_journal` tables alone.
+Copy the **service_role** key (Project Settings → API). Keep it secret.
+
+### 2. GitHub Actions (the always-on worker)
+Repo → Settings → Secrets and variables → Actions → add:
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_KEY`
+- `ANTHROPIC_API_KEY` (optional, only if you enable `news.llm_enabled`)
+
+Then Actions → **MarketPilot worker** → *Run workflow* with `research` once.
+After that it trades every hour at :07 and re-researches every Saturday.
+(GitHub pauses scheduled workflows after 60 days with no commits — push a
+commit or re-enable it if that happens.)
+
+### 3. Streamlit dashboard
+In Streamlit Community Cloud secrets add `APP_PASSWORD`, `SUPABASE_URL` and
+`SUPABASE_SERVICE_KEY`. The app file is still `app.py`.
+
+## Local use
+
+```bash
+pip install -r requirements.txt
+python -m marketpilot demo --days 21          # offline demo on synthetic data
+streamlit run app.py                          # view the demo results
+python -m marketpilot research                # real data (Yahoo Finance)
+python -m marketpilot run-once                # one trading cycle
+python -m marketpilot report                  # win rate, win/loss, expectancy, P&L
+python -m marketpilot kill   |  resume        # kill switch
+pytest                                        # 20 tests
+```
+
+Add `--db supabase` (with `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` in env) to use Supabase.
+
+## Configuration
+Everything is in `config/settings.yaml`: symbols, intervals, cost model, risk
+limits, approval gate, win-rate goal. Keep `config/events.yaml` updated with
+high-impact events (CPI, FOMC, NFP, BoE…) — new trades are blocked around them.
+
+## Known limitations
+- Yahoo Finance (`yfinance`) is free and unofficial: delayed, sometimes missing,
+  no real bid/ask. Costs are modelled, not observed. Before any live use, switch
+  to a broker or exchange data feed.
+- Fills are simulated at the next bar's open; real orders can fill worse.
+- Strategies are simple, well-known rules. Passing the gate is evidence, not proof;
+  forward paper results are what count.
+- The v0.3 manual app is kept in `legacy/app_v03.py`.
