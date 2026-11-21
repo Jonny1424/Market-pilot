@@ -455,3 +455,61 @@ def test_apply_learning_updates_strategy_status(settings, store):
                            "opened_at": f"2026-01-{i % 28 + 1:02d}", "r_multiple": 2.0 if i % 2 else -0.6})
     msgs = apply_learning(store, settings)
     assert msgs and store.strategies("approved")[0]["strategy"] == "turtle_55"
+
+
+# ---------------- v0.8 confluence, structure stops, CCU ----------------
+
+def test_confluence_score_counts_agreeing_factors():
+    from marketpilot.bots.confluence import MAX_SCORE, score
+    row = {"close": 105.0, "sma200": 100.0, "ema20": 104.0, "ema50": 102.0, "rsi14": 60.0, "atr14": 2.0,
+           "dc_high": 106.0, "dc_low": 95.0, "hi252": 120.0, "lo252": 80.0, "range_hi60": 110.0,
+           "range_lo60": 100.0, "volume": 150.0, "vol_avg20": 100.0, "atr_pct_rank": 0.5}
+    s_long, hits = score(row, 1, market_ok=True)
+    assert s_long == len(hits) and {"trend", "swing_trend", "momentum", "level", "fib", "volume", "calm",
+                                    "market"} == set(hits) and s_long == MAX_SCORE
+    s_short, _ = score(row, -1, market_ok=False)
+    assert s_short < s_long
+
+
+def test_structure_stop_is_beyond_swing_and_clamped():
+    from marketpilot.backtest import plan_levels
+    c = CostModel()
+    sig = Signal(1, 2.0, NO_TARGET, 10, stop_swing=True)
+    stop, _, _ = plan_levels(100.0, 2.0, sig, c, swing=97.0)      # 0.5 ATR below the 97 swing low
+    assert stop == pytest.approx(96.0)
+    stop, _, _ = plan_levels(100.0, 2.0, sig, c, swing=99.9)      # too tight -> at least 1 ATR
+    assert stop == pytest.approx(98.0)
+    stop, _, _ = plan_levels(100.0, 2.0, sig, c, swing=80.0)      # too wide -> at most 4 ATR
+    assert stop == pytest.approx(92.0)
+    stop, _, _ = plan_levels(100.0, 2.0, Signal(1, 2.0, NO_TARGET, 10), c, swing=80.0)
+    assert stop == pytest.approx(96.0)                            # ATR stop when not a swing variant
+
+
+def test_ccu_three_checkmarks_signal():
+    from marketpilot.strategies import CCUBottom
+    s = CCUBottom()
+    prev = {"close": 90, "sma200": 100, "rsi14": 30, "stoch_k": 25, "stoch_d": 30, "atr14": 2}
+    row = {"close": 88, "sma200": 100, "rsi14": 24, "stoch_k": 10, "stoch_d": 15, "atr14": 2}
+    assert s.signal(prev, row).direction == 1
+    assert s.signal(prev, {**row, "close": 101}) is None          # must be below the 200 MA
+    assert s.signal(row, row) is None                             # only on the first day of the setup
+
+
+def test_backtest_records_confluence_and_breakdown():
+    from marketpilot.backtest import walk_forward
+    from marketpilot.strategies import Breakout as B
+    df = SyntheticProvider().history("SPY", "1d", datetime(2018, 1, 1, tzinfo=UTC), datetime(2026, 6, 1, tzinfo=UTC))
+    r = walk_forward(df, B, CostModel(2, 3), False)
+    assert r["oos_trades"] and all(0 <= t.confluence <= 8 for t in r["oos_trades"])
+    assert sum(v["trades"] for v in r["by_confluence"].values()) == r["oos"]["trades"]
+
+
+def test_cycle_writes_market_snapshot_and_shadow_confluence(small_settings, store):
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    t = datetime(2025, 6, 2, 0, 7, tzinfo=UTC)
+    for d in range(60):
+        eng.cycle(t + timedelta(days=d))
+    mk = {m["symbol"]: m for m in store.market()}
+    assert set(mk) == {"EURUSD=X", "SPY"} and 0 <= mk["SPY"]["conf_long"] <= 8
+    sh = store.shadow_trades()
+    assert sh and all(s["confluence"] is not None and "confluence" in s["note"] for s in sh)
