@@ -117,3 +117,18 @@ safety:
   max_consecutive_feed_failures: 3
   stale_multiplier: 3.0          # data is stale if last bar older than 3x interval (market-hours aware)
   max_daily_trades: 20
+
+# Time Machine: Monte Carlo odds for every trade before it is taken (v0.9).
+# Records only until the Learning Lab shows the odds are reliable (calibration).
+time_machine:
+  enabled: true
+  paths: 10000          # replays per real candidate
+  shadow_paths: 2000    # replays per practice (shadow) trade
+  min_p_target: 0       # e.g. 0.35 = skip trades whose target-first odds are below 35%
+  min_exp_r: null       # e.g. 0.0 = skip trades whose simulated average R is negative
+
+# Headlines for open positions and benchmarks, shown on the dashboard (context only).
+headlines:
+  always: [SPY, QQQ, BTC-USD, EURUSD=X, GLD]
+  per_symbol: 3
+  max_symbols: 12
