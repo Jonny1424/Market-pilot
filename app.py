@@ -12,8 +12,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
-VERSION = "v0.9"
+VERSION = "v0.10"
 st.set_page_config(page_title=f"MarketPilot {VERSION}", page_icon="📈", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -159,26 +160,14 @@ def odds_bar(p_target, p_stop, p_neither):
         f"{p_stop:.0%}</div>", unsafe_allow_html=True)
 
 
-def candle_chart(df, symbol, levels=None, height=460):
-    d = df.tail(260).copy()
-    fig = go.Figure(go.Candlestick(x=d.index, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
-                                   increasing=dict(line=dict(color=UP), fillcolor=UP),
-                                   decreasing=dict(line=dict(color=DOWN), fillcolor=DOWN), name=symbol))
-    full = df["close"]
-    for n, col in ((20, "#f5c451"), (50, ACCENT), (200, VIOLET)):
-        ma = full.ewm(span=n, adjust=False).mean() if n < 200 else full.rolling(n).mean()
-        fig.add_trace(go.Scatter(x=d.index, y=ma.reindex(d.index), name=f"{'EMA' if n < 200 else 'SMA'} {n}",
-                                 line=dict(color=col, width=1.4), hoverinfo="skip"))
-    for name, y, col in (levels or []):
-        if y is not None and np.isfinite(y):
-            fig.add_hline(y=y, line=dict(color=col, width=1.3, dash="dash"),
-                          annotation_text=f"{name} {y:,.4g}", annotation_position="right",
-                          annotation_font=dict(color=col, size=11))
-    fig.update_layout(xaxis_rangeslider_visible=False)
-    return style(fig, height, legend=True)
+def tv_chart(df, symbol, levels=None, trades=None, height=540):
+    """TradingView-style chart: drag the price axis to zoom prices, the date axis to zoom time."""
+    from marketpilot.tvchart import chart_html
+    components.html(chart_html(df, symbol, levels, trades, height), height=height + 18)
 
 
 authenticate()
+from marketpilot.bots import conviction as cv  # noqa: E402
 from marketpilot.bots import timemachine as tm  # noqa: E402
 from marketpilot.bots.performance import report  # noqa: E402
 from marketpilot.config import load_settings  # noqa: E402
@@ -381,7 +370,7 @@ elif page == "Markets":
                 t = pos[0]
                 levels = [("entry", t.get("entry_price"), ACCENT), ("stop", t.get("stop"), DOWN),
                           ("target", t.get("target"), UP)]
-            st.plotly_chart(candle_chart(df, choice, levels), width="stretch")
+            tv_chart(df, choice, levels, [t for t in trades if t["symbol"] == choice])
             c = st.columns(4)
             c[0].metric("RSI 14", f"{row['rsi14']:.0f}")
             c[1].metric("Daily range (ATR)", f"{row['atr_pct']:.2%}" if pd.notna(row["atr_pct"]) else "–")
@@ -389,8 +378,9 @@ elif page == "Markets":
             c[3].metric("Short confluence", f"{int(row['conf_short'])}/8")
             if df.attrs.get("synthetic"):
                 st.caption("Live prices unavailable right now — showing synthetic demo data.")
-            st.caption("Click a row in the watchlist to chart it. Dashed lines show an open position's entry, "
-                       "stop and target. Confluence describes the chart; trades still need an approved signal.")
+            st.caption("Click a row in the watchlist to chart it. Arrows mark where the bots bought or sold; "
+                       "circles mark exits with the result in R. Dashed lines show an open position's entry, stop "
+                       "and target.")
 
 # ================= Trade planner (Time Machine) =================
 elif page == "Trade planner":
@@ -429,6 +419,32 @@ elif page == "Trade planner":
             ("Typical length", f"{odds.median_bars:.0f} days", "median, all replays", "muted"),
         ])
         odds_bar(odds.p_target, odds.p_stop, odds.p_neither)
+        from marketpilot.bots import confluence as conf
+        mf_cfg = (settings.raw.get("market_filter") or {}).get(ALL_SYMBOLS.get(symbol, ""), {})
+        bench = mf_cfg.get("symbol") if isinstance(mf_cfg, dict) else None
+        market_ok = None
+        if bench and symbol not in (mf_cfg.get("exclude") or []):
+            bc = price_history(bench)["close"]
+            if len(bc) > 200:
+                market_ok = bool(bc.iloc[-1] > bc.rolling(200).mean().iloc[-1])
+        c_score, c_hits = conf.score(last, d, market_ok)
+        g = cv.grade(c_score, odds, settings.raw.get("conviction", {}))
+        g_col = {"A+": UP, "A": ACCENT, "B": WARN, "C": MUTED}[g]
+        names = {"trend": "Long-term trend", "swing_trend": "Medium-term trend", "momentum": "Momentum",
+                 "level": "Key level", "fib": "Fibonacci zone", "volume": "Volume", "calm": "Calm volatility",
+                 "market": "Market trend"}
+        ticks = "".join(f"<span class='mp-tag' style='color:{UP if k in c_hits else MUTED}'>"
+                        f"{'✓' if k in c_hits else '·'} {names.get(k, k)}</span>" for k, _ in conf.FACTORS)
+        g_text = {"A+": "High confluence and the Time Machine confirms.",
+                  "A": "High confluence, but the Time Machine does not confirm.",
+                  "B": "Medium confluence: the Time Machine's odds don't count toward the grade below 6/8.",
+                  "C": "Low confluence: few factors agree with this side."}[g]
+        st.markdown(f"<div class='mp-panel' style='display:flex;gap:18px;align-items:center;flex-wrap:wrap'>"
+                    f"<div style='font-size:2.1rem;font-weight:800;color:{g_col};font-family:JetBrains Mono,"
+                    f"monospace;min-width:70px;text-align:center'>{g}</div><div style='flex:1;min-width:260px'>"
+                    f"<b>Conviction grade · confluence {c_score}/8</b><div class='mp-note'>{g_text}</div>"
+                    f"<div style='margin-top:6px;line-height:2'>{ticks}</div></div></div>",
+                    unsafe_allow_html=True)
         verdict = ("This plan has a positive simulated edge." if odds.exp_r > 0.05 else
                    "This is close to a coin flip after the stop and target are accounted for."
                    if odds.exp_r > -0.05 else "The odds lean against this plan.")
@@ -436,6 +452,9 @@ elif page == "Trade planner":
                     f"<span class='mp-note'>Entry {entry:,.4g} · stop {stop:,.4g} · target {target:,.4g} · "
                     f"ATR {atr:,.4g}. Break-even win rate for {rr:.2g}:1 is {1 / (1 + rr):.0%}.</span></div>",
                     unsafe_allow_html=True)
+        st.markdown("### Chart with your plan")
+        tv_chart(df, symbol, [("entry", entry, ACCENT), ("stop", stop, DOWN), ("target", target, UP)],
+                 [t for t in trades if t["symbol"] == symbol], height=460)
         a, b = st.columns([1.6, 1])
         with a:
             st.markdown("### 10,000 possible futures")
@@ -488,6 +507,7 @@ elif page == "Trade planner":
                              "side": "LONG" if c["direction"] == 1 else "SHORT",
                              "strategy": c["strategy"].split("(")[0], "decision": c["decision"],
                              "target first": t_["p_target"], "stop first": t_["p_stop"], "avg R": t_["exp_r"],
+                             "grade": c["evidence"].get("grade", ""),
                              "setup history": t_.get("hist_trades", 0)})
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
                 "target first": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"),
@@ -503,11 +523,11 @@ elif page == "Positions":
     else:
         op = pd.DataFrame(open_pos)
         op["side"] = op["direction"].map({1: "LONG", -1: "SHORT"})
-        for c_ in ("tm_p_target", "tm_exp_r"):
+        for c_ in ("tm_p_target", "tm_exp_r", "grade"):
             if c_ not in op:
                 op[c_] = None
         st.dataframe(op[["symbol", "side", "status", "strategy", "opened_at", "entry_price", "stop", "target",
-                         "quantity", "risk_gbp", "notional_gbp", "bars_held", "confluence", "tm_p_target",
+                         "quantity", "risk_gbp", "notional_gbp", "bars_held", "grade", "confluence", "tm_p_target",
                          "tm_exp_r"]], hide_index=True, width="stretch", column_config={
             "tm_p_target": st.column_config.NumberColumn("Odds: target first", format="percent"),
             "tm_exp_r": st.column_config.NumberColumn("Odds: avg R", format="%+.2f"),
@@ -515,9 +535,9 @@ elif page == "Positions":
             "notional_gbp": st.column_config.NumberColumn("Size £", format="£%.2f")})
         pick = st.selectbox("Chart a position", [t["symbol"] for t in open_pos])
         t = next(x for x in open_pos if x["symbol"] == pick)
-        st.plotly_chart(candle_chart(price_history(pick), pick, [
+        tv_chart(price_history(pick), pick, [
             ("entry", t.get("entry_price"), ACCENT), ("stop", t.get("stop"), DOWN),
-            ("target", t.get("target"), UP)]), width="stretch")
+            ("target", t.get("target"), UP)], [x for x in trades if x["symbol"] == pick])
         if t.get("note"):
             st.caption(t["note"])
 
@@ -560,8 +580,9 @@ elif page == "Bot decisions":
         cand["odds"] = cand["evidence"].apply(lambda e: ((e or {}).get("time_machine") or {}).get("p_target")
                                               if isinstance(e, dict) else None)
         cand["confluence"] = cand["evidence"].apply(lambda e: (e or {}).get("confluence") if isinstance(e, dict) else None)
+        cand["grade"] = cand["evidence"].apply(lambda e: (e or {}).get("grade") if isinstance(e, dict) else None)
         st.dataframe(cand[["bar_time", "symbol", "side", "strategy", "regime", "decision", "expected_r",
-                           "confluence", "odds", "why"]], hide_index=True, width="stretch",
+                           "grade", "confluence", "odds", "why"]], hide_index=True, width="stretch",
                      column_config={"expected_r": st.column_config.NumberColumn("EV (R)", format="%+.3f"),
                                     "odds": st.column_config.NumberColumn("Target first", format="percent")})
 
@@ -624,7 +645,28 @@ elif page == "Learning lab":
                ("Shadow win rate", f"{(r_sh > 0).mean():.0%}" if len(r_sh) else "—", "all strategies", "muted"),
                ("Shadow expectancy", f"{r_sh.mean():+.2f}R" if len(r_sh) else "—", "all strategies",
                 sign_cls(r_sh.mean()) if len(r_sh) else "muted")])
-        t1, t2, t3 = st.tabs(["Leaderboard", "Does confluence work?", "Is the Time Machine right?"])
+        t1, t2, t4, t3 = st.tabs(["Leaderboard", "Does confluence work?", "Do A+ trades win more?",
+                                  "Is the Time Machine right?"])
+        with t4:
+            gs = cv.grade_stats(shadow_all.to_dict("records") + trades)
+            st.caption("A+ = 6-8 confluence factors agree AND the Time Machine confirms. A = 6-8 without "
+                       "confirmation, B = 4-5, C = 0-3. If A+ clearly beats the rest over 30+ trades, set "
+                       "`conviction.min_grade: \"A+\"` so the paper account only takes A+ setups.")
+            if gs.empty:
+                st.info("Grades are recorded from v0.10 on; this fills in as graded trades close.")
+            else:
+                fig = go.Figure(go.Bar(x=gs["grade"], y=gs["expectancy_r"],
+                                       marker_color=[UP if v > 0 else DOWN for v in gs["expectancy_r"]],
+                                       text=[f"{n} trades" for n in gs["trades"]], textposition="outside",
+                                       hovertemplate="%{x}: %{y:+.3f}R<extra></extra>"))
+                fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+                st.plotly_chart(style(fig, 280, "R per trade"), width="stretch")
+                st.dataframe(gs, hide_index=True, width="stretch", column_config={
+                    "grade": "Grade", "trades": "Trades",
+                    "win_rate": st.column_config.NumberColumn("Win rate", format="percent"),
+                    "expectancy_r": st.column_config.NumberColumn("Expectancy R", format="%+.3f"),
+                    "profit_factor": st.column_config.NumberColumn("Profit factor", format="%.2f"),
+                    "t_stat": st.column_config.NumberColumn("t-stat", format="%.1f")})
         with t1:
             fs = forward_stats(store)
             if fs.empty:
@@ -665,8 +707,8 @@ elif page == "Learning lab":
                     "actual_win_pct": st.column_config.NumberColumn("Actually won", format="percent"),
                     "avg_forecast_r": st.column_config.NumberColumn("Forecast avg R", format="%+.2f"),
                     "actual_avg_r": st.column_config.NumberColumn("Actual avg R", format="%+.2f")})
-                st.caption("If higher forecasts really do win more often (30+ trades per row), set "
-                           "`time_machine.min_p_target` so the bots skip the weakest setups.")
+                st.caption("The Time Machine's vote only counts on 6-8 confluence setups (the A+ grade). "
+                           "This table checks whether its forecasts match reality overall.")
 
 # ================= Bot activity =================
 elif page == "Bot activity":
@@ -753,7 +795,6 @@ elif page == "Settings":
             st.success(f"Cycle done: {s}")
     with b:
         acc = settings.account
-        tmc = settings.raw.get("time_machine", {})
         st.markdown("### Risk rules")
         cards([("Balance", f"£{acc['starting_balance']:,.0f}", "paper", "muted"),
                ("Risk / trade", f"{acc['risk_per_trade_pct']}%",
@@ -761,10 +802,10 @@ elif page == "Settings":
                ("Daily loss limit", f"{acc['daily_loss_limit_pct']}%", "then pause", "muted"),
                ("Max positions", f"{acc['max_open_positions']}", f"leverage {acc['max_leverage']}x", "muted")])
         st.markdown("### Filters (record-only until proven)")
-        min_p_txt = f"{float(tmc['min_p_target']):.0%}" if tmc.get("min_p_target") else "off"
+        cvc = settings.raw.get("conviction", {})
         st.write(f"Confluence minimum: **{settings.raw.get('confluence', {}).get('min_score', 0)}** / 8 · "
-                 f"Time Machine minimum target-first odds: **{min_p_txt}** · "
-                 f"minimum average R: **{'off' if tmc.get('min_exp_r') is None else tmc.get('min_exp_r')}**")
+                 f"minimum grade: **{cvc.get('min_grade') or 'off'}** · Time Machine votes at "
+                 f"**{cvc.get('high_confluence', 6)}+/8** confluence")
         st.caption("Change these in config/settings.yaml once the Learning lab shows they help.")
         st.markdown("### Phone notifications")
         st.caption("Trade alerts and a daily summary go to the free ntfy app. Test: GitHub → Actions → "

@@ -1,9 +1,17 @@
-# MarketPilot v0.9 — Multi-Agent AI Paper Trading
+# MarketPilot v0.10 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.10:** TradingView-style charts (TradingView's open-source Lightweight Charts, bundled in
+`marketpilot/vendor`, Apache 2.0): drag the price axis to zoom prices, drag the date axis to zoom time,
+drag the chart to scroll back; bot entries/exits as markers. **Conviction grade**: A+ = 6-8 confluence
+factors agree AND the Time Machine confirms; A = 6-8 unconfirmed; B = 4-5; C = 0-3. The Time Machine only
+votes on 6+ setups. `conviction.min_grade` (off) can restrict the paper account to A+ once the Learning lab
+proves it. Fixed: the market-trend factor now agrees with shorts when the benchmark is falling.
+Run `supabase/migrations/20261121_marketpilot_v010.sql`.
 
 **v0.9:** a **Time Machine** bot replays the next days of every candidate trade
 10,000 times from the market's own past daily moves (5-day blocks) and records the odds of hitting the
