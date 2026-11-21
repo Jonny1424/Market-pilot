@@ -35,7 +35,8 @@ class PaperBroker:
     def submit(self, *, candidate_id: str, symbol: str, asset_class: str, strategy_key: str,
                signal: Signal, regime: str, bar_time: pd.Timestamp, atr: float, qty: float,
                risk_gbp: float, risk_per_unit: float, fx: float, notional: float, cost_r: float,
-               swing: float | None = None, confluence: int | None = None, conf_text: str = "") -> bool:
+               swing: float | None = None, confluence: int | None = None, conf_text: str = "",
+               extra: dict | None = None, extra_note: str = "") -> bool:
         return self.store.open_trade({
             "trade_id": str(uuid.uuid4()), "candidate_id": candidate_id, "symbol": symbol,
             "asset_class": asset_class, "strategy": strategy_key, "direction": signal.direction,
@@ -44,10 +45,11 @@ class PaperBroker:
             "target_atr": signal.target_atr, "max_hold_bars": signal.max_hold, "quantity": qty,
             "risk_gbp": risk_gbp, "risk_per_unit": risk_per_unit, "fx_to_gbp": fx,
             "notional_gbp": notional, "cost_r": cost_r,
-            "note": signal.note + (f" | confluence {confluence}/8: {conf_text}" if confluence is not None else ""),
+            "note": signal.note + (f" | confluence {confluence}/8: {conf_text}" if confluence is not None else "")
+                    + (f" | {extra_note}" if extra_note else ""),
             "trail_atr": signal.trail_atr, "exit_ma": signal.exit_ma, "exit_on": signal.exit_on,
             "stop_swing": int(signal.stop_swing), "swing_level": swing, "confluence": confluence,
-            "last_bar_time": str(bar_time)})
+            "last_bar_time": str(bar_time), **(extra or {})})
 
     def process(self, symbol: str, ind: pd.DataFrame, interval: str, cost: CostModel,
                 now: pd.Timestamp, log) -> list[dict]:

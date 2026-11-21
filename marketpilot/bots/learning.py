@@ -59,12 +59,14 @@ def researched_params(store) -> dict[str, str]:
 
 
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
-                   regime: str, params: dict[str, str], market_ok: bool | None = None) -> int:
+                   regime: str, params: dict[str, str], market_ok: bool | None = None,
+                   cost=None, tm_paths: int = 0) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
     from ..backtest import swing_level
     from ..strategies import strategy_from_key
     from . import confluence as conf
+    from . import timemachine as tm
 
     row, prev = ind.iloc[-1], ind.iloc[-2]
     bar_time = ind.index[-1]
@@ -78,12 +80,19 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
         sig = strat.signal(prev, row)
         if sig is None or (sig.direction == -1 and cls not in SHORTABLE) or pd.isna(row["atr14"]):
             continue
+        odds = None
+        if tm_paths and cost is not None:
+            try:
+                odds = tm.odds_for(ind, sig, cost, swing_level(row, sig.direction), n_paths=tm_paths)
+            except Exception:
+                odds = None
         ok = broker.submit(
             candidate_id=f"shadow|{symbol}|{strat.key}|{bar_time.isoformat()}", symbol=symbol,
             asset_class=cls, strategy_key=strat.key, signal=sig, regime=regime, bar_time=bar_time,
             atr=float(row["atr14"]), qty=0.0, risk_gbp=1.0, risk_per_unit=1.0, fx=1.0,
             notional=0.0, cost_r=0.0, swing=swing_level(row, sig.direction),
-            confluence=(cs := conf.score(row, sig.direction, market_ok))[0], conf_text=conf.describe(cs[1]))
+            confluence=(cs := conf.score(row, sig.direction, market_ok))[0], conf_text=conf.describe(cs[1]),
+            extra=tm.trade_fields(odds), extra_note=odds.describe() if odds else "")
         opened += int(bool(ok))
     return opened
 
