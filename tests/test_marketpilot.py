@@ -618,3 +618,64 @@ def test_market_factor_matches_trade_direction():
     assert "market" in score(row, 1, True)[1] and "market" not in score(row, -1, True)[1]
     assert "market" in score(row, -1, False)[1] and "market" not in score(row, 1, False)[1]
     assert "market" not in score(row, 1, None)[1]
+
+
+# ---------------- v0.11: loss control ----------------
+from marketpilot.bots import losscontrol as lc
+
+
+def test_loss_control_multipliers_combine_with_floor():
+    cfg = lc.config({})
+    assert lc.multiplier(cfg, vol_rank=0.5)[0] == 1.0
+    assert lc.multiplier(cfg, vol_rank=0.85)[0] == 0.5
+    assert lc.multiplier(cfg, vol_rank=0.97)[0] == 0.25
+    assert lc.multiplier(cfg, drawdown_pct=3.5)[0] == 0.5
+    assert lc.multiplier(cfg, drawdown_pct=7.0)[0] == 0.25
+    assert lc.multiplier(cfg, streak=4)[0] == 0.5
+    m, notes = lc.multiplier(cfg, vol_rank=0.97, drawdown_pct=7.0, streak=5)
+    assert m == cfg["min_mult"] and len(notes) == 3
+    assert lc.multiplier({**cfg, "enabled": False}, vol_rank=0.99)[0] == 1.0
+    assert lc.multiplier(cfg, vol_rank=float("nan"))[0] == 1.0
+
+
+def test_drawdown_streak_and_concentration():
+    assert lc.drawdown_pct([500, 520, 510], 494) == pytest.approx(5.0)
+    assert lc.drawdown_pct([500], 510) == 0.0
+    closed = [{"closed_at": f"2026-01-0{i}", "r_multiple": r} for i, r in enumerate([1.0, -1, -1, -0.5], 1)]
+    assert lc.loss_streak(closed) == 3
+    cfg = lc.config({})
+    open_t = [{"asset_class": "crypto", "risk_gbp": 2.5}] * 3
+    reasons = lc.concentration_reasons("crypto", open_t, 2.5, 500, cfg)
+    assert any("crypto" in r for r in reasons)
+    assert lc.concentration_reasons("bonds", open_t[:1], 2.5, 500, cfg) == []
+    big = [{"asset_class": "stocks", "risk_gbp": 7.0}, {"asset_class": "bonds", "risk_gbp": 7.0}]
+    assert any("open risk" in r for r in lc.concentration_reasons("forex", big, 2.5, 500, cfg))
+
+
+def test_risk_manager_sizes_down_in_high_volatility(small_settings):
+    from marketpilot.bots.risk import RiskManager
+    rm = RiskManager(small_settings)
+    kw = dict(symbol="SPY", asset_class="stocks", equity=500.0, realized_today=0.0, trades_today=0,
+              open_trades=[], entry_est=100.0, risk_per_unit=2.0, fx_to_gbp=1.0, kill_switch=False)
+    normal, calm_high = rm.evaluate(**kw, vol_rank=0.3), rm.evaluate(**kw, vol_rank=0.9)
+    assert normal.ok and calm_high.ok
+    assert calm_high.risk_gbp == pytest.approx(normal.risk_gbp / 2)
+    assert calm_high.risk_mult == 0.5 and calm_high.risk_notes
+
+
+def test_backtest_comparison_shows_smaller_drawdown_when_wild_trades_lose():
+    class T:
+        def __init__(self, r, v):
+            self.r_multiple, self.vol_rank = r, v
+    trades = [T(1.0, 0.3), T(-1.0, 0.9), T(-1.0, 0.9), T(-1.0, 0.9), T(1.5, 0.4), T(-1.0, 0.3)]
+    out = lc.compare(trades, lc.config({}))
+    assert out["scaled"]["max_drawdown_r"] < out["flat"]["max_drawdown_r"]
+    assert out["share_reduced"] == pytest.approx(0.5) and 0 < out["dd_cut_pct"] < 1
+
+
+def test_engine_saves_account_risk_state(small_settings, store):
+    import json
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    eng.cycle(datetime(2025, 6, 2, 0, 7, tzinfo=UTC))
+    st = json.loads(store.get_control("risk_state", "{}"))
+    assert {"drawdown_pct", "loss_streak", "account_mult", "open_risk_gbp", "open_risk_cap_gbp"} <= set(st)
