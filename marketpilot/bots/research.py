@@ -125,4 +125,8 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 rows_out.append(row)
     n_ok = len({(r["asset_class"], r["strategy"]) for r in rows_out if r["status"] == "approved"})
     store.log("strategy_research", f"research complete: {n_ok} strategy/market combinations approved")
+    try:
+        store.prune(int((settings.raw.get("storage") or {}).get("keep_log_days", 60)))
+    except Exception:
+        pass
     return rows_out

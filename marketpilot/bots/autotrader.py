@@ -13,7 +13,7 @@ import uuid
 
 import pandas as pd
 
-from ..backtest import MANAGEMENT, plan_levels, realized_r, step_position, trade_r
+from ..backtest import MANAGEMENT, plan_levels, step_position, trade_r
 from ..costs import CostModel
 from ..data import interval_td
 from ..strategies import Signal
