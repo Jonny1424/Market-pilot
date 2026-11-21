@@ -1,9 +1,17 @@
-# MarketPilot v0.8 — Multi-Agent AI Paper Trading
+# MarketPilot v0.9 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.9:** a **Time Machine** bot replays the next days of every candidate trade
+10,000 times from the market's own past daily moves (5-day blocks) and records the odds of hitting the
+target vs the stop, plus the strategy's past record on that market. Odds are saved on every paper and
+shadow trade, and the Learning lab checks them against real outcomes before they're allowed to filter
+trades (`time_machine.min_p_target`, off by default). New **Trade planner** page to test your own plan,
+headlines for open positions, and a redesigned dark trading-app dashboard (sidebar navigation,
+candlestick charts with entry/stop/target, watchlist). Run `supabase/migrations/20261121_marketpilot_v09.sql`.
 
 **v0.8:** ideas from professional trading educators and exchange apps — a
 Confluence bot that scores every signal on 8 factors and measures whether high
