@@ -112,6 +112,17 @@ def get_store():
     return make_store(os.environ.get("MARKETPILOT_DB")), "local SQLite (demo)"
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def q(method: str, *args):
+    """Cached database read (60 s). Every click in Streamlit reruns the whole page, so without
+    this each click re-downloaded every table from Supabase."""
+    return getattr(get_store()[0], method)(*args)
+
+
+def refresh_data():
+    q.clear()
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def price_history(symbol: str, days: int = 1200) -> pd.DataFrame:
     """Daily bars for charts and the trade planner (cached 15 min)."""
@@ -176,12 +187,12 @@ settings = load_settings()
 store, backend = get_store()
 start_bal = settings.account["starting_balance"]
 target_wr = settings["goals"]["target_win_rate"]
-kill = store.get_control("kill_switch", "off") == "on"
-trades = store.trades()
+kill = q("get_control", "kill_switch", "off") == "on"
+trades = q("trades")
 rep = report(trades, start_bal)
 o = rep["overall"]
 closed = rep["closed"]
-eq_curve = pd.DataFrame(store.equity_curve())
+eq_curve = pd.DataFrame(q("equity_curve"))
 equity_now = float(eq_curve["equity_gbp"].iloc[-1]) if not eq_curve.empty else start_bal + o["pnl_gbp"]
 open_pos = [t for t in trades if t["status"] in ("open", "pending")]
 ALL_SYMBOLS = {s: cls for cls, u in settings["universe"].items() for s in u["symbols"]}
@@ -223,7 +234,7 @@ def sign_cls(v):
 if page == "Dashboard":
     goals = settings["goals"]
     try:
-        rs = json.loads(store.get_control("risk_state", "") or "{}")
+        rs = json.loads(q("get_control", "risk_state", "") or "{}")
     except Exception:
         rs = {}
     eq_vals = eq_curve["equity_gbp"].tolist() if not eq_curve.empty else [start_bal]
@@ -280,7 +291,7 @@ if page == "Dashboard":
     with right:
         st.markdown("### Open positions")
         if open_pos:
-            mk = {m["symbol"]: m for m in store.market()}
+            mk = {m["symbol"]: m for m in q("market")}
             html = "<div class='mp-panel'>"
             for t in open_pos[:8]:
                 side = "LONG" if int(t["direction"]) == 1 else "SHORT"
@@ -300,7 +311,7 @@ if page == "Dashboard":
         else:
             st.markdown("<div class='mp-panel mp-note'>No open positions. The bots only trade strategies that "
                         "passed research, so quiet days are normal.</div>", unsafe_allow_html=True)
-        fg = store.get_control("fear_greed", "")
+        fg = q("get_control", "fear_greed", "")
         if fg:
             try:
                 f = json.loads(fg)
@@ -316,7 +327,7 @@ if page == "Dashboard":
             except Exception:
                 pass
         st.markdown("### Headlines")
-        hl = store.get_control("headlines", "")
+        hl = q("get_control", "headlines", "")
         items = []
         if hl:
             try:
@@ -340,7 +351,7 @@ if page == "Dashboard":
 
 # ================= Markets =================
 elif page == "Markets":
-    mk = pd.DataFrame(store.market())
+    mk = pd.DataFrame(q("market"))
     if mk.empty:
         st.info("The worker fills this in on its next hourly run.")
     else:
@@ -514,7 +525,7 @@ elif page == "Trade planner":
             fig.update_xaxes(title="result (R)")
             st.plotly_chart(style(fig, 380), width="stretch")
         st.markdown("### What the bots planned recently")
-        cand = [c for c in store.candidates(300) if (c.get("evidence") or {}).get("time_machine")]
+        cand = [c for c in q("candidates", 300) if (c.get("evidence") or {}).get("time_machine")]
         if cand:
             rows = []
             for c in cand[:40]:
@@ -584,7 +595,7 @@ elif page == "Trade history":
 
 # ================= Bot decisions =================
 elif page == "Bot decisions":
-    cand = pd.DataFrame(store.candidates(1000))
+    cand = pd.DataFrame(q("candidates", 1000))
     if cand.empty:
         st.info("No candidates yet.")
     else:
@@ -606,7 +617,7 @@ elif page == "Bot decisions":
 elif page == "Strategies":
     st.caption("Tested walk-forward on unseen data with fees, spreads and slippage, pooled per market group, "
                "then checked once on an untouched holdout. Only APPROVED strategies trade.")
-    strat = pd.DataFrame(store.strategies())
+    strat = pd.DataFrame(q("strategies"))
     if strat.empty:
         st.info("No research yet.")
     else:
@@ -686,7 +697,7 @@ elif page == "Learning lab":
     st.caption("Shadow bots practise every strategy on every market with the same rules as the paper account, "
                "in R, with no position limits. Strong forward evidence promotes a strategy; weak evidence demotes it.")
     try:
-        shadow_all = pd.DataFrame(store.shadow_trades())
+        shadow_all = pd.DataFrame(q("shadow_trades"))
     except Exception:
         shadow_all = pd.DataFrame()
     if shadow_all.empty:
@@ -766,7 +777,7 @@ elif page == "Learning lab":
 
 # ================= Bot activity =================
 elif page == "Bot activity":
-    ev = pd.DataFrame(store.events(500))
+    ev = pd.DataFrame(q("events", 500))
     if ev.empty:
         st.info("No activity yet.")
     else:
@@ -835,12 +846,14 @@ elif page == "Settings":
         st.markdown("### Kill switch")
         st.caption("ON = no new trades. Open positions keep their stops and targets managed.")
         if kill:
-            st.write(f"Reason: {store.get_control('pause_reason', '') or 'manual'}")
+            st.write(f"Reason: {q('get_control', 'pause_reason', '') or 'manual'}")
             if st.button("Release kill switch", type="primary"):
                 safety.release()
+                refresh_data()
                 st.rerun()
         elif st.button("⛔ Engage kill switch", type="primary"):
             safety.engage("manual kill switch from dashboard")
+            refresh_data()
             st.rerun()
         st.markdown("### Run the bots now")
         st.caption("The GitHub worker runs every hour. Use this to test.")
@@ -849,6 +862,7 @@ elif page == "Settings":
             from marketpilot.engine import Engine
             with st.spinner("Scanning markets…"):
                 s = Engine(settings, make_provider("yfinance"), store).cycle(datetime.now(timezone.utc))
+            refresh_data()
             st.success(f"Cycle done: {s}")
     with b:
         acc = settings.account

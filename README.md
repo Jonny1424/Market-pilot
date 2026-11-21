@@ -5,6 +5,13 @@ A team of trading bots that research strategies, backtest them honestly, then
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
 
+**v0.12.1 — reliability and speed:** database reads now page past Supabase's 1,000-row cap (the
+strategy table was at 692 rows and practice trades would have been cut off silently); the worker caches
+reads within a cycle and writes the market overview in one request; prices for all markets download in
+one batched request with a per-run cache (benchmarks no longer downloaded twice); `Infinity`/`NaN` are no
+longer written into stored JSON; old log and candidate rows are pruned after 60 days; one health line is
+logged per cycle; the dashboard caches database reads for 60 s.
+
 **v0.12 — trade management:** three ways to handle a trade once it moves in our favour, built into the
 shared exit logic (backtester and paper broker stay identical): `base` (each strategy's own exits),
 `breakeven` (once a day closes +1R, stop moves to entry + costs), `partial` (bank half at +1R, rest's stop
