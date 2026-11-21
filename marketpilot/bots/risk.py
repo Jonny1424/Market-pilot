@@ -12,6 +12,8 @@ class RiskResult:
     notional_gbp: float = 0.0
     cost_r: float = 0.0
     reasons: list[str] = field(default_factory=list)
+    risk_mult: float = 1.0
+    risk_notes: list[str] = field(default_factory=list)
 
 
 class RiskManager:
@@ -19,10 +21,14 @@ class RiskManager:
         self.a = settings.account
         self.costs = settings["costs"]
         self.max_daily_trades = settings["safety"]["max_daily_trades"]
+        from .losscontrol import config
+        self.lc = config(settings.raw)
 
     def evaluate(self, *, symbol: str, asset_class: str, equity: float, realized_today: float,
                  trades_today: int, open_trades: list[dict], entry_est: float,
-                 risk_per_unit: float, fx_to_gbp: float, kill_switch: bool) -> RiskResult:
+                 risk_per_unit: float, fx_to_gbp: float, kill_switch: bool,
+                 vol_rank=None, drawdown_pct: float = 0.0, loss_streak: int = 0) -> RiskResult:
+        from .losscontrol import concentration_reasons, multiplier
         a, reasons = self.a, []
         if kill_switch:
             reasons.append("kill switch is ON")
@@ -40,7 +46,11 @@ class RiskManager:
         if reasons:
             return RiskResult(False, reasons=reasons)
 
-        risk_gbp = equity * a["risk_per_trade_pct"] / 100
+        mult, notes = multiplier(self.lc, vol_rank=vol_rank, drawdown_pct=drawdown_pct, streak=loss_streak)
+        risk_gbp = equity * a["risk_per_trade_pct"] / 100 * mult
+        conc = concentration_reasons(asset_class, active, risk_gbp, equity, self.lc)
+        if conc:
+            return RiskResult(False, reasons=conc, risk_mult=mult, risk_notes=notes)
         qty = risk_gbp / (risk_per_unit * fx_to_gbp)
         notional = qty * entry_est * fx_to_gbp
         used = sum(float(t.get("notional_gbp") or 0) for t in active)
@@ -62,4 +72,4 @@ class RiskManager:
             return RiskResult(False, cost_r=cost_r, reasons=[
                 f"costs ≈ £{cost_gbp:.2f} = {cost_r:.0%} of the £{risk_gbp:.2f} risk "
                 f"(limit {a['max_cost_fraction_of_risk']:.0%})"])
-        return RiskResult(True, qty, risk_gbp, notional, cost_r)
+        return RiskResult(True, qty, risk_gbp, notional, cost_r, risk_mult=mult, risk_notes=notes)

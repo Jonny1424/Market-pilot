@@ -19,6 +19,8 @@ from ..metrics import summarize
 from ..storage import now_iso
 from ..strategies import ALL_STRATEGIES, SHORTABLE
 from .learning import forward_stats, forward_verdict
+from .losscontrol import compare as lc_compare
+from .losscontrol import config as lc_config
 
 
 def research(settings, provider, store, now: datetime, symbols: list[str] | None = None,
@@ -32,6 +34,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
             store.save_strategy({**old, "status": "removed", "reasons": ["symbol no longer in universe"]})
     filters = settings.raw.get("market_filter") or {}
     learn_cfg = settings.raw.get("learning")
+    lc_cfg = lc_config(settings.raw)
     fstats = forward_stats(store) if learn_cfg else None
     rows_out = []
     for cls_name, spec in settings["universe"].items():
@@ -77,6 +80,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 costs += [t.cost_r for t in r["oos_trades"]]
             pooled = {"oos": summarize(oos_r), "holdout": summarize(hold_r)}
             by_conf = confluence_breakdown(oos_all)
+            lc = lc_compare(sorted(oos_all, key=lambda t: t.entry_time), lc_cfg)
             ok, reasons = passes_gate(pooled, gate)
             if learn_cfg:  # forward (shadow) evidence can promote or demote
                 verdict, why = forward_verdict(fstats, cls_name, strat.name, learn_cfg)
@@ -89,6 +93,11 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 f"OOS n={o['trades']:<4} win {o['win_rate']:.0%} exp {o['expectancy_r']:+.3f}R "
                 f"PF {o['profit_factor']:.2f} t {o['t_stat']:.1f} | holdout n={pooled['holdout']['trades']} "
                 f"exp {pooled['holdout']['expectancy_r']:+.3f}R" + ("" if ok else f"  — {reasons[0]}"))
+            if lc:
+                log(f"research: {cls_name:<7} {strat.name:<20} loss control: max drawdown "
+                    f"{lc['flat']['max_drawdown_r']:.1f}R -> {lc['scaled']['max_drawdown_r']:.1f}R "
+                    f"({lc['dd_cut_pct']:.0%} smaller), total {lc['flat']['total_r']:+.1f}R -> "
+                    f"{lc['scaled']['total_r']:+.1f}R, {lc['share_reduced']:.0%} of trades sized down")
             for symbol, r in per_symbol.items():
                 sid = f"{symbol}|{strat.name}"
                 if sid in retired:
@@ -97,7 +106,8 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                        "strategy": strat.name, "family": strat.family, "params": r["final_params"],
                        "status": "approved" if ok else "rejected", "reasons": reasons,
                        "oos": {**pooled["oos"], "symbol_trades": r["oos"]["trades"],
-                               "symbol_expectancy_r": r["oos"]["expectancy_r"], "by_confluence": by_conf},
+                               "symbol_expectancy_r": r["oos"]["expectancy_r"], "by_confluence": by_conf,
+                               "loss_control": lc},
                        "holdout": pooled["holdout"],
                        "avg_cost_r": float(sum(costs) / len(costs)) if costs else 0.0,
                        "researched_at": now_iso(), "data_start": r["data_start"], "data_end": r["data_end"]}
