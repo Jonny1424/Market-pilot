@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-VERSION = "v0.11"
+VERSION = "v0.12"
 st.set_page_config(page_title=f"MarketPilot {VERSION}", page_icon="📈", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -648,6 +648,37 @@ elif page == "Strategies":
         st.markdown("### Win rate vs expectancy")
         st.plotly_chart(style(fig, 380, "R per trade"), width="stretch")
         st.caption("Green = approved. A high win rate is not the same as profitable; t-stat below 2 could be luck.")
+        st.markdown("### Trade management: same trades, three ways to handle them")
+        mode_now = (settings.raw.get("trade_management") or {}).get("mode", "base")
+        st.caption(f"Base = each strategy's own exits · Breakeven = stop to breakeven once a day closes +1R · "
+                   f"Partial = bank half at +1R, rest to breakeven. In use now: **{mode_now}**. "
+                   "Filled in by each Saturday research run.")
+        rows_m = []
+        for _, r in g.iterrows():
+            for mode, v in ((r["oos"] or {}).get("management") or {}).items():
+                rows_m.append({"group": r["asset_class"], "strategy": r["strategy"], "status": r["status"],
+                               "mode": mode, "expectancy": v["expectancy_r"], "full_losses": v["full_loss_rate"],
+                               "scratches": v.get("scratch_rate"), "avg_loss": v["avg_loss_r"],
+                               "max_dd": v["max_drawdown_r"], "holdout": v["holdout_expectancy_r"]})
+        if rows_m:
+            mdf = pd.DataFrame(rows_m)
+            appr = mdf[mdf["status"] == "approved"]
+            if not appr.empty:
+                summ = appr.groupby("mode").agg(expectancy=("expectancy", "mean"), full_losses=("full_losses", "mean"),
+                                                avg_loss=("avg_loss", "mean"), max_dd=("max_dd", "mean"),
+                                                holdout=("holdout", "mean")).reindex(["base", "breakeven", "partial"]).dropna(how="all")
+                cards([(m.title(), f"{v['expectancy']:+.3f}R", f"full losses {v['full_losses']:.0%} · worst run "
+                        f"{v['max_dd']:.1f}R", "up" if m == mode_now else "muted") for m, v in summ.iterrows()])
+            st.dataframe(mdf.sort_values(["status", "group", "strategy", "mode"]), hide_index=True, width="stretch",
+                         column_config={
+                             "expectancy": st.column_config.NumberColumn("Expectancy R", format="%+.3f"),
+                             "full_losses": st.column_config.NumberColumn("Full −1R losses", format="percent"),
+                             "scratches": st.column_config.NumberColumn("Breakeven exits", format="percent"),
+                             "avg_loss": st.column_config.NumberColumn("Avg loss R", format="%+.2f"),
+                             "max_dd": st.column_config.NumberColumn("Worst run R", format="%.1f"),
+                             "holdout": st.column_config.NumberColumn("Holdout R", format="%+.3f")})
+        else:
+            st.info("Appears after the next research run.")
 
 # ================= Learning lab =================
 elif page == "Learning lab":
@@ -839,6 +870,9 @@ elif page == "Settings":
             f"- Max **{lcc.get('max_positions_per_group', 3)}** open positions per market group; total open risk "
             f"max **{lcc.get('max_open_risk_pct', 3):g}%**\n"
             f"- Never below **{lcc.get('min_mult', 0.25):g}×** normal risk")
+        st.markdown(f"### Trade management: **{(settings.raw.get('trade_management') or {}).get('mode', 'base')}**")
+        st.caption("base = strategy's own exits · breakeven = stop to breakeven at +1R · partial = bank half at "
+                   "+1R, rest to breakeven. Compared on the same trades every Saturday (Strategies page).")
         st.markdown("### Filters (record-only until proven)")
         cvc = settings.raw.get("conviction", {})
         st.write(f"Confluence minimum: **{settings.raw.get('confluence', {}).get('min_score', 0)}** / 8 · "

@@ -1,9 +1,16 @@
-# MarketPilot v0.11 — Multi-Agent AI Paper Trading
+# MarketPilot v0.12 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.12 — trade management:** three ways to handle a trade once it moves in our favour, built into the
+shared exit logic (backtester and paper broker stay identical): `base` (each strategy's own exits),
+`breakeven` (once a day closes +1R, stop moves to entry + costs), `partial` (bank half at +1R, rest's stop
+to breakeven). Research replays every out-of-sample trade all three ways and reports expectancy, full-loss
+rate, breakeven exits and worst run. The mode in use is `trade_management.mode`.
+Run `supabase/migrations/20261121_marketpilot_v012.sql`.
 
 **v0.11 — loss control over win rate:** a **Loss Control** bot sizes every new trade: half risk when
 a market's volatility is in the top 20% of its year (quarter in the top 5%), half after the account falls
