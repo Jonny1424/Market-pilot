@@ -1,9 +1,16 @@
-# MarketPilot v0.10 — Multi-Agent AI Paper Trading
+# MarketPilot v0.11 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.11 — loss control over win rate:** a **Loss Control** bot sizes every new trade: half risk when
+a market's volatility is in the top 20% of its year (quarter in the top 5%), half after the account falls
+3% below its peak (quarter at 6%), half after 4 losses in a row, never below 0.25x. Caps: 3 open positions
+per market group, 3% total open risk. Research now reports, per strategy, how much smaller the worst
+losing run would have been with volatility scaling. The dashboard leads with expectancy, drawdown,
+average loss and current risk size instead of win rate. No database migration needed.
 
 **v0.10:** TradingView-style charts (TradingView's open-source Lightweight Charts, bundled in
 `marketpilot/vendor`, Apache 2.0): drag the price axis to zoom prices, drag the date axis to zoom time,

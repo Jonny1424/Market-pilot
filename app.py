@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-VERSION = "v0.10"
+VERSION = "v0.11"
 st.set_page_config(page_title=f"MarketPilot {VERSION}", page_icon="📈", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -221,16 +221,33 @@ def sign_cls(v):
 
 # ================= Dashboard =================
 if page == "Dashboard":
-    wr_gap = (o["win_rate"] - target_wr) * 100
+    goals = settings["goals"]
+    try:
+        rs = json.loads(store.get_control("risk_state", "") or "{}")
+    except Exception:
+        rs = {}
+    eq_vals = eq_curve["equity_gbp"].tolist() if not eq_curve.empty else [start_bal]
+    peak = max(eq_vals + [equity_now])
+    dd_now = (peak - equity_now) / peak * 100 if peak else 0.0
+    dd_max = 0.0
+    run_peak = eq_vals[0] if eq_vals else start_bal
+    for v in eq_vals + [equity_now]:
+        run_peak = max(run_peak, v)
+        dd_max = max(dd_max, (run_peak - v) / run_peak * 100 if run_peak else 0)
+    mult = float(rs.get("account_mult", 1.0))
     cards([
         ("Equity", f"£{equity_now:,.2f}", f"{o['return_pct']:+.2f}% since start", sign_cls(o["return_pct"])),
+        ("Expectancy", f"{o['expectancy_r']:+.2f}R" if o["trades"] else "—",
+         f"goal above {goals.get('min_expectancy_r', 0.1):+.2f}R per trade",
+         sign_cls(o["expectancy_r"] - goals.get("min_expectancy_r", 0.1)) if o["trades"] else "muted"),
+        ("Drawdown now", f"{dd_now:.1f}%", f"worst {dd_max:.1f}% · limit {goals.get('max_drawdown_pct', 10):.0f}%",
+         "down" if dd_max >= goals.get("max_drawdown_pct", 10) else ("warn" if dd_now >= 3 else "up")),
+        ("Average loss", f"{o['avg_loss_r']:+.2f}R" if o["losses"] else "—",
+         f"{o['losses']} losing trades", "up" if o["losses"] and o["avg_loss_r"] > -1.0 else "muted"),
+        ("Risk per trade now", f"{mult:.2g}×", ", ".join(rs.get("notes", [])) or "normal size",
+         "warn" if mult < 1 else "up"),
         ("Win rate", f"{o['win_rate']:.0%}" if o["trades"] else "—",
-         f"{wr_gap:+.0f} pts vs {target_wr:.0%} goal" if o["trades"] else f"goal {target_wr:.0%}",
-         sign_cls(wr_gap) if o["trades"] else "muted"),
-        ("Closed trades", f"{o['trades']}", f"{o['wins']} won · {o['losses']} lost", "muted"),
-        ("Expectancy", f"{o['expectancy_r']:+.2f}R", "average result per trade", sign_cls(o["expectancy_r"])),
-        ("Profit factor", f"{o['profit_factor']:.2f}" if o["trades"] else "—", "gross wins ÷ gross losses", "muted"),
-        ("Max drawdown", f"{o['max_drawdown_r']:.1f}R", "worst peak-to-trough", "muted"),
+         f"{o['wins']} won · {o['losses']} lost", "muted"),
     ])
     left, right = st.columns([2.1, 1])
     with left:
@@ -317,10 +334,9 @@ if page == "Dashboard":
         else:
             st.markdown("<div class='mp-panel mp-note'>Headlines appear after the next hourly run.</div>",
                         unsafe_allow_html=True)
-    if o["trades"]:
-        st.caption(f"Win rate 95% range with {o['trades']} trades: {o['win_rate_lo']:.0%}–{o['win_rate_hi']:.0%}. "
-                   "Win rate alone can mislead: a tiny target and wide stop wins often and still loses money. "
-                   "Expectancy (average R per trade) is what has to be positive.")
+    st.caption("The goal is small losses and a positive average result, not a high win rate. Loss Control "
+               "sizes new trades down in wild markets, after a drawdown or a losing streak, and caps how much "
+               "can be at risk at once.")
 
 # ================= Markets =================
 elif page == "Markets":
@@ -602,17 +618,24 @@ elif page == "Strategies":
         g["t"] = g["oos"].apply(lambda x: x.get("t_stat", float("nan")))
         g["holdout"] = g["holdout"].apply(lambda x: x["expectancy_r"])
         g["why"] = g["reasons"].apply(lambda r: "; ".join(r) if r else "passed all gates")
+        g["max_dd"] = g["oos"].apply(lambda x: x.get("max_drawdown_r"))
+        g["dd_cut"] = g["oos"].apply(lambda x: (x.get("loss_control") or {}).get("dd_cut_pct"))
         n_app = int((g["status"] == "approved").sum())
         cards([("Approved", f"{n_app}", f"of {len(g)} tested", "up"),
                ("Rejected", f"{len(g) - n_app}", "failed a gate", "muted")])
         st.dataframe(g.sort_values(["status", "t"], ascending=[True, False])[
-            ["asset_class", "strategy", "status", "trades", "win_rate", "expectancy", "pf", "t", "holdout", "why"]],
+            ["asset_class", "strategy", "status", "trades", "expectancy", "pf", "max_dd", "dd_cut", "win_rate", "t",
+             "holdout", "why"]],
             hide_index=True, width="stretch", column_config={
                 "win_rate": st.column_config.NumberColumn("Win rate", format="percent"),
                 "expectancy": st.column_config.NumberColumn("Expectancy R", format="%+.3f"),
                 "pf": st.column_config.NumberColumn("Profit factor", format="%.2f"),
                 "t": st.column_config.NumberColumn("t-stat", format="%.1f"),
-                "holdout": st.column_config.NumberColumn("Holdout R", format="%+.3f")})
+                "holdout": st.column_config.NumberColumn("Holdout R", format="%+.3f"),
+                "max_dd": st.column_config.NumberColumn("Max drawdown R", format="%.1f"),
+                "dd_cut": st.column_config.NumberColumn("Drawdown cut by loss control", format="percent")})
+        st.caption("'Drawdown cut' = how much smaller the worst losing run would have been with volatility "
+                   "scaling, on the same trades. Filled in by the next Saturday research run.")
         fig = go.Figure(go.Scatter(
             x=g["win_rate"], y=g["expectancy"], mode="markers",
             text=g["strategy"] + " · " + g["asset_class"],
@@ -734,7 +757,10 @@ elif page == "Learn":
 - **t-statistic**: how many standard errors the average result is above zero. Below ~2 it could be luck.
 - **Monte Carlo (Time Machine)**: replay thousands of possible futures from a market's own history to see the odds
   of a plan. It shows risk honestly but can't predict news; its forecasts are checked in the Learning lab.
-- **Costs**: spreads, slippage and fees are charged on every simulated trade.""")
+- **Costs**: spreads, slippage and fees are charged on every simulated trade.
+- **Loss control over win rate**: what decides survival is how big and how clustered the losses are.
+  Halving size when markets are wild, after a drawdown, or after a losing streak keeps bad runs shallow,
+  and a shallow drawdown is much easier to recover from (−10% needs +11%; −50% needs +100%).""")
     with t2:
         st.markdown("""
 - **Build a case, not a hunch.** Stack layers of confluence (trend, key level, Fibonacci zone, structure) and use
@@ -801,6 +827,18 @@ elif page == "Settings":
                 f"£{acc['starting_balance'] * acc['risk_per_trade_pct'] / 100:.2f}", "muted"),
                ("Daily loss limit", f"{acc['daily_loss_limit_pct']}%", "then pause", "muted"),
                ("Max positions", f"{acc['max_open_positions']}", f"leverage {acc['max_leverage']}x", "muted")])
+        lcc = settings.raw.get("loss_control", {})
+        st.markdown("### Loss control")
+        st.markdown(
+            f"- Volatility in the top {1 - lcc.get('vol_high_rank', 0.8):.0%} of the year → "
+            f"**{lcc.get('vol_high_mult', 0.5):g}×** risk (top {1 - lcc.get('vol_extreme_rank', 0.95):.0%} → "
+            f"**{lcc.get('vol_extreme_mult', 0.25):g}×**)\n"
+            f"- Account {lcc.get('dd_soft_pct', 3):g}% below peak → **{lcc.get('dd_soft_mult', 0.5):g}×**; "
+            f"{lcc.get('dd_hard_pct', 6):g}% → **{lcc.get('dd_hard_mult', 0.25):g}×**\n"
+            f"- {lcc.get('streak_losses', 4)} losses in a row → **{lcc.get('streak_mult', 0.5):g}×** until a win\n"
+            f"- Max **{lcc.get('max_positions_per_group', 3)}** open positions per market group; total open risk "
+            f"max **{lcc.get('max_open_risk_pct', 3):g}%**\n"
+            f"- Never below **{lcc.get('min_mult', 0.25):g}×** normal risk")
         st.markdown("### Filters (record-only until proven)")
         cvc = settings.raw.get("conviction", {})
         st.write(f"Confluence minimum: **{settings.raw.get('confluence', {}).get('min_score', 0)}** / 8 · "
