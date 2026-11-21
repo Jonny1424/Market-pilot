@@ -89,6 +89,15 @@ goals:
   max_drawdown_pct: 10.0       # the account should never fall more than this below its peak
   min_expectancy_r: 0.10       # average result per trade we aim to beat
 
+# Trade management (v0.12): what happens once a trade moves in our favour.
+#   base      = each strategy's own stops, targets and trailing stops
+#   breakeven = once a day closes 1R in profit, move the stop to breakeven (entry + costs)
+#   partial   = bank half at +1R, then move the rest's stop to breakeven (Peter Brandt style)
+# Research tests all three on the same trades every Saturday; the winner is set here.
+trade_management:
+  mode: base
+  compare: [base, breakeven, partial]
+
 # Loss Control (v0.11): size every new trade down when big or clustered losses are more likely.
 loss_control:
   enabled: true
