@@ -584,3 +584,37 @@ def test_shadow_trades_carry_time_machine_odds(small_settings, store):
     sh = store.shadow_trades()
     assert sh and all(s["tm_p_target"] is not None and 0 <= s["tm_p_target"] <= 1 for s in sh)
     assert any("time machine" in s["note"] for s in sh)
+
+
+# ---------------- v0.10: conviction grade ----------------
+from marketpilot.bots import conviction as cv
+
+
+def test_time_machine_only_votes_on_high_confluence():
+    good = tm.Odds(p_target=0.5, p_stop=0.3, p_neither=0.2, exp_r=0.3, median_bars=8, paths=100, reward_risk=2)
+    bad = tm.Odds(p_target=0.2, p_stop=0.7, p_neither=0.1, exp_r=-0.4, median_bars=8, paths=100, reward_risk=2)
+    assert cv.grade(7, good) == "A+" and cv.grade(6, bad) == "A" and cv.grade(8, None) == "A"
+    assert cv.grade(5, good) == "B" and cv.grade(5, bad) == "B"      # odds ignored below 6
+    assert cv.grade(2, good) == "C"
+    assert cv.passes("A+", "A+") and not cv.passes("A", "A+") and cv.passes("C", None)
+    assert "time machine confirms" in cv.describe("A+", 7, good)
+
+
+def test_min_grade_filter_blocks_lower_grades_and_grades_are_saved(small_settings, store):
+    small_settings.raw["time_machine"] = {"enabled": True, "paths": 300, "shadow_paths": 200}
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    t = datetime(2025, 6, 2, 0, 7, tzinfo=UTC)
+    for d in range(30):
+        eng.cycle(t + timedelta(days=d))
+    sh = store.shadow_trades()
+    assert sh and all(s["grade"] in cv.GRADES for s in sh)
+    stats = cv.grade_stats([{**s, "status": "closed", "r_multiple": 1.0} for s in sh])
+    assert set(stats["grade"]) <= set(cv.GRADES) and stats["trades"].sum() == len(sh)
+
+
+def test_market_factor_matches_trade_direction():
+    from marketpilot.bots.confluence import score
+    row = pd.Series({"close": 100.0, "volume": 0.0})
+    assert "market" in score(row, 1, True)[1] and "market" not in score(row, -1, True)[1]
+    assert "market" in score(row, -1, False)[1] and "market" not in score(row, 1, False)[1]
+    assert "market" not in score(row, 1, None)[1]
