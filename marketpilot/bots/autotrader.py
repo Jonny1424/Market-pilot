@@ -34,7 +34,8 @@ class PaperBroker:
 
     def submit(self, *, candidate_id: str, symbol: str, asset_class: str, strategy_key: str,
                signal: Signal, regime: str, bar_time: pd.Timestamp, atr: float, qty: float,
-               risk_gbp: float, risk_per_unit: float, fx: float, notional: float, cost_r: float) -> bool:
+               risk_gbp: float, risk_per_unit: float, fx: float, notional: float, cost_r: float,
+               swing: float | None = None, confluence: int | None = None, conf_text: str = "") -> bool:
         return self.store.open_trade({
             "trade_id": str(uuid.uuid4()), "candidate_id": candidate_id, "symbol": symbol,
             "asset_class": asset_class, "strategy": strategy_key, "direction": signal.direction,
@@ -42,8 +43,10 @@ class PaperBroker:
             "signal_bar_time": str(bar_time), "atr": atr, "stop_atr": signal.stop_atr,
             "target_atr": signal.target_atr, "max_hold_bars": signal.max_hold, "quantity": qty,
             "risk_gbp": risk_gbp, "risk_per_unit": risk_per_unit, "fx_to_gbp": fx,
-            "notional_gbp": notional, "cost_r": cost_r, "note": signal.note,
+            "notional_gbp": notional, "cost_r": cost_r,
+            "note": signal.note + (f" | confluence {confluence}/8: {conf_text}" if confluence is not None else ""),
             "trail_atr": signal.trail_atr, "exit_ma": signal.exit_ma, "exit_on": signal.exit_on,
+            "stop_swing": int(signal.stop_swing), "swing_level": swing, "confluence": confluence,
             "last_bar_time": str(bar_time)})
 
     def process(self, symbol: str, ind: pd.DataFrame, interval: str, cost: CostModel,
@@ -67,8 +70,11 @@ class PaperBroker:
                     continue
                 d = int(t["direction"])
                 entry = cost.market_fill(float(first["open"]), d)
-                sig = Signal(d, _f(t["stop_atr"]), _f(t["target_atr"]), int(t["max_hold_bars"]))
-                stop, target, rpu = plan_levels(entry, _f(t["atr"]), sig, cost)
+                sig = Signal(d, _f(t["stop_atr"]), _f(t["target_atr"]), int(t["max_hold_bars"]),
+                             stop_swing=bool(_f(t.get("stop_swing"))))
+                sw = t.get("swing_level")
+                sw = None if sw is None or pd.isna(sw) else float(sw)
+                stop, target, rpu = plan_levels(entry, _f(t["atr"]), sig, cost, sw)
                 qty = _f(t["risk_gbp"]) / (rpu * _f(t["fx_to_gbp"], 1.0))  # keep £ risk at plan
                 t.update({"status": "open", "entry_price": entry, "stop": stop, "target": target,
                           "risk_per_unit": rpu, "quantity": qty, "opened_at": str(fill_bar_time),

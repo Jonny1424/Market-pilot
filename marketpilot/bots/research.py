@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from ..backtest import market_filter_series, passes_gate, walk_forward
+from ..backtest import confluence_breakdown, market_filter_series, passes_gate, walk_forward
 from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
@@ -62,7 +62,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 except Exception:
                     filt_df = None
         for strat in ALL_STRATEGIES:
-            per_symbol, oos_r, hold_r, costs = {}, [], [], []
+            per_symbol, oos_r, hold_r, costs, oos_all = {}, [], [], [], []
             for symbol, df in data.items():
                 mk = None
                 if filt_spec and symbol not in set(filt_spec.get("exclude", [])):
@@ -72,9 +72,11 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                                  market_ok=mk)
                 per_symbol[symbol] = r
                 oos_r += [t.r_multiple for t in r["oos_trades"]]
+                oos_all += r["oos_trades"]
                 hold_r += [t.r_multiple for t in r["holdout_trades"]]
                 costs += [t.cost_r for t in r["oos_trades"]]
             pooled = {"oos": summarize(oos_r), "holdout": summarize(hold_r)}
+            by_conf = confluence_breakdown(oos_all)
             ok, reasons = passes_gate(pooled, gate)
             if learn_cfg:  # forward (shadow) evidence can promote or demote
                 verdict, why = forward_verdict(fstats, cls_name, strat.name, learn_cfg)
@@ -95,7 +97,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                        "strategy": strat.name, "family": strat.family, "params": r["final_params"],
                        "status": "approved" if ok else "rejected", "reasons": reasons,
                        "oos": {**pooled["oos"], "symbol_trades": r["oos"]["trades"],
-                               "symbol_expectancy_r": r["oos"]["expectancy_r"]},
+                               "symbol_expectancy_r": r["oos"]["expectancy_r"], "by_confluence": by_conf},
                        "holdout": pooled["holdout"],
                        "avg_cost_r": float(sum(costs) / len(costs)) if costs else 0.0,
                        "researched_at": now_iso(), "data_start": r["data_start"], "data_end": r["data_end"]}

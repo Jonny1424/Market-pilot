@@ -59,10 +59,12 @@ def researched_params(store) -> dict[str, str]:
 
 
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
-                   regime: str, params: dict[str, str]) -> int:
+                   regime: str, params: dict[str, str], market_ok: bool | None = None) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
+    from ..backtest import swing_level
     from ..strategies import strategy_from_key
+    from . import confluence as conf
 
     row, prev = ind.iloc[-1], ind.iloc[-2]
     bar_time = ind.index[-1]
@@ -80,7 +82,8 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
             candidate_id=f"shadow|{symbol}|{strat.key}|{bar_time.isoformat()}", symbol=symbol,
             asset_class=cls, strategy_key=strat.key, signal=sig, regime=regime, bar_time=bar_time,
             atr=float(row["atr14"]), qty=0.0, risk_gbp=1.0, risk_per_unit=1.0, fx=1.0,
-            notional=0.0, cost_r=0.0)
+            notional=0.0, cost_r=0.0, swing=swing_level(row, sig.direction),
+            confluence=(cs := conf.score(row, sig.direction, market_ok))[0], conf_text=conf.describe(cs[1]))
         opened += int(bool(ok))
     return opened
 
@@ -97,6 +100,22 @@ def forward_stats(store) -> pd.DataFrame:
         s = summarize(g["r_multiple"].astype(float))
         out.append({"asset_class": cls, "strategy": strat, **s})
     return pd.DataFrame(out)
+
+
+def confluence_stats(store) -> pd.DataFrame:
+    """Closed shadow trades by confluence bucket: does more confluence win more often?"""
+    from .confluence import bucket
+    rows = [t for t in store.shadow_trades("closed") if t.get("confluence") is not None]
+    if not rows:
+        return pd.DataFrame(columns=["confluence", "trades", "win_rate", "expectancy_r", "t_stat"])
+    df = pd.DataFrame(rows)
+    df["bucket"] = df["confluence"].astype(int).map(bucket)
+    out = []
+    for b, g in df.groupby("bucket"):
+        s = summarize(g["r_multiple"].astype(float))
+        out.append({"confluence": b, **s})
+    order = {"low (0-3)": 0, "medium (4-5)": 1, "high (6-8)": 2}
+    return pd.DataFrame(sorted(out, key=lambda r: order.get(r["confluence"], 9)))
 
 
 def forward_verdict(stats: pd.DataFrame, cls: str, strategy: str, cfg: dict) -> tuple[str | None, str]:
