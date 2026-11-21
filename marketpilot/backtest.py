@@ -40,6 +40,7 @@ class SimTrade:
     r_multiple: float = 0.0
     cost_r: float = 0.0
     confluence: int = 0
+    vol_rank: float | None = None
 
 
 def swing_level(row, direction: int):
@@ -186,6 +187,8 @@ def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_s
         stop, target, rpu = plan_levels(entry, row["atr14"], sig, cost, swing_level(row, sig.direction))
         t = SimTrade(strategy.key, sig.direction, idx[i], idx[e], entry, stop, target)
         t.confluence = conf_score(row, sig.direction, None if mk is None else bool(mk[i]))[0]
+        vr = row.get("atr_pct_rank")
+        t.vol_rank = float(vr) if vr is not None and np.isfinite(vr) else None
         st = new_state(sig, stop, target)
         j = e
         while j < n:

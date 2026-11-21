@@ -22,6 +22,7 @@ from .bots.decision import DecisionBot
 from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
 from .bots.news import NewsBot
 from .bots import conviction as cv
+from .bots import losscontrol as lc
 from .bots import timemachine as tm
 from .bots.performance import realized_today, report, retirement_review
 from .bots.regime import classify_row
@@ -66,6 +67,14 @@ class Engine:
     def log(self, bot, msg, level="info"):
         self.store.log(bot, msg, level, self._ts)
 
+    def _equity_hist(self) -> list[dict]:
+        if getattr(self, "_eq_hist", None) is None:
+            try:
+                self._eq_hist = self.store.equity_curve()
+            except Exception:
+                self._eq_hist = []
+        return self._eq_hist
+
     def equity(self, trades, last_prices) -> tuple[float, float]:
         realized = sum(float(t["pnl_gbp"] or 0) for t in trades if t["status"] == "closed")
         unreal = sum(mark_to_market(t, last_prices[t["symbol"]]) for t in trades
@@ -85,6 +94,7 @@ class Engine:
     def cycle(self, now: datetime) -> dict:
         now_ts = pd.Timestamp(now)
         self._ts = now_ts.isoformat()
+        self._eq_hist = None
         summary = {"new_orders": 0, "closed": 0, "candidates": 0, "rejected": 0, "failed_feeds": 0,
                    "shadow_opened": 0, "shadow_closed": 0}
         if self.learning_on:
@@ -188,6 +198,8 @@ class Engine:
                     trades = self.store.trades()
                     eq, _ = self.equity(trades, last_prices)
                     pnl_today, n_today = realized_today(trades, now_ts)
+                    acct_dd = lc.drawdown_pct([e["equity_gbp"] for e in self._equity_hist()], eq)
+                    acct_streak = lc.loss_streak([t for t in trades if t["status"] == "closed"])
                     entry_est = cost.market_fill(float(row["close"]), sig.direction)
                     _, _, rpu = plan_levels(entry_est, float(row["atr14"]), sig, cost,
                                             swing_level(row, sig.direction))
@@ -195,7 +207,8 @@ class Engine:
                         symbol=symbol, asset_class=cls, equity=eq, realized_today=pnl_today,
                         trades_today=n_today, open_trades=[t for t in trades if t["status"] in ("open", "pending")],
                         entry_est=entry_est, risk_per_unit=rpu, fx_to_gbp=fx,
-                        kill_switch=self.safety.kill_switch_on())
+                        kill_switch=self.safety.kill_switch_on(),
+                        vol_rank=row.get("atr_pct_rank"), drawdown_pct=acct_dd, loss_streak=acct_streak)
                     reasons += risk_res.reasons
                 go = dec.trade and risk_res is not None and risk_res.ok
                 evidence = {**dec.evidence, "signal": sig.note, "confluence": c_score,
@@ -203,7 +216,8 @@ class Engine:
                             "grade": c_grade}
                 if risk_res is not None:
                     evidence.update({"qty": risk_res.quantity, "risk_gbp": risk_res.risk_gbp,
-                                     "notional_gbp": risk_res.notional_gbp, "cost_r": risk_res.cost_r})
+                                     "notional_gbp": risk_res.notional_gbp, "cost_r": risk_res.cost_r,
+                                     "risk_mult": risk_res.risk_mult, "risk_notes": risk_res.risk_notes})
                 self.store.record_candidate({
                     "candidate_id": cid, "bar_time": bar_time.isoformat(), "symbol": symbol,
                     "asset_class": cls, "strategy": strat.key, "direction": sig.direction,
@@ -218,13 +232,18 @@ class Engine:
                                        swing=swing_level(row, sig.direction), confluence=c_score,
                                        conf_text=conf.describe(c_hits), extra={**tm.trade_fields(odds), "grade": c_grade},
                                        extra_note=cv.describe(c_grade, c_score, odds)
-                                       + (f" | {odds.describe()}" if odds else ""))
+                                       + (f" | {odds.describe()}" if odds else "")
+                                       + (f" | risk {risk_res.risk_mult:.2g}x: {', '.join(risk_res.risk_notes)}"
+                                          if risk_res.risk_mult < 1 else ""))
                     summary["new_orders"] += 1
                     self.log("trade_decision", f"ORDER {symbol} {'LONG' if sig.direction > 0 else 'SHORT'} "
-                             f"[{strat.key}] grade {c_grade}, EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}")
+                             f"[{strat.key}] grade {c_grade}, EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}"
+                             + (f" ({risk_res.risk_mult:.2g}x: {', '.join(risk_res.risk_notes)})"
+                                if risk_res.risk_mult < 1 else ""))
                 else:
                     summary["rejected"] += 1
 
+        self._save_risk_state(last_prices)
         if self.live:
             self._fear_greed()
             self._headlines()
@@ -278,6 +297,24 @@ class Engine:
             r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10).json()["data"][0]
             self.store.set_control("fear_greed", json.dumps(
                 {"value": int(r["value"]), "label": r["value_classification"], "ts": self._ts}))
+        except Exception:
+            pass
+
+    def _save_risk_state(self, last_prices) -> None:
+        try:
+            import json
+            trades = self.store.trades()
+            eq, _ = self.equity(trades, last_prices)
+            cfg = lc.config(self.s.raw)
+            dd = lc.drawdown_pct([e["equity_gbp"] for e in self._equity_hist()], eq)
+            streak = lc.loss_streak([t for t in trades if t["status"] == "closed"])
+            mult, notes = lc.account_multiplier(dd, streak, cfg) if cfg.get("enabled", True) else (1.0, [])
+            active = [t for t in trades if t["status"] in ("open", "pending")]
+            self.store.set_control("risk_state", json.dumps({
+                "ts": self._ts, "drawdown_pct": round(dd, 2), "loss_streak": streak,
+                "account_mult": round(max(mult, cfg["min_mult"]) if mult < 1 else 1.0, 3), "notes": notes,
+                "open_risk_gbp": round(sum(float(t.get("risk_gbp") or 0) for t in active), 2),
+                "open_risk_cap_gbp": round(eq * float(cfg["max_open_risk_pct"]) / 100, 2)}))
         except Exception:
             pass
 

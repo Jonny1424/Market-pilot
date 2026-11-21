@@ -52,8 +52,8 @@ def daily_summary(overall: dict, equity: float, open_positions: int, target_wr: 
     o = overall
     send("MarketPilot daily summary",
          f"Equity £{equity:,.2f} | open positions {open_positions}\n"
-         f"Closed trades {o['trades']} | win rate {o['win_rate']:.0%} (goal {target_wr:.0%})\n"
-         f"Expectancy {o['expectancy_r']:+.2f}R | P&L £{o['pnl_gbp']:+.2f}",
+         f"Closed trades {o['trades']} | avg loss {o['avg_loss_r']:+.2f}R | max drawdown {o['max_drawdown_r']:.1f}R\n"
+         f"Expectancy {o['expectancy_r']:+.2f}R | win rate {o['win_rate']:.0%} | P&L £{o['pnl_gbp']:+.2f}",
          tags="bar_chart", priority=2)
 
 
