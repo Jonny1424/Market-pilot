@@ -513,3 +513,74 @@ def test_cycle_writes_market_snapshot_and_shadow_confluence(small_settings, stor
     assert set(mk) == {"EURUSD=X", "SPY"} and 0 <= mk["SPY"]["conf_long"] <= 8
     sh = store.shadow_trades()
     assert sh and all(s["confluence"] is not None and "confluence" in s["note"] for s in sh)
+
+
+# ---------------- v0.9: Time Machine ----------------
+from marketpilot.bots import timemachine as tm
+
+
+def _walk(n=800, drift=0.0, vol=0.01, seed=1):
+    rng = np.random.default_rng(seed)
+    c = 100 * np.exp(np.cumsum(rng.normal(drift, vol, n)))
+    o = np.concatenate([[100], c[:-1]])
+    h = np.maximum(o, c) * (1 + vol / 2)
+    l = np.minimum(o, c) * (1 - vol / 2)
+    idx = pd.date_range("2020-01-01", periods=n, freq="D", tz="UTC")
+    return pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": 1e6}, index=idx)
+
+
+def test_time_machine_symmetric_plan_is_near_coin_flip():
+    df = _walk(seed=4)                                     # a sample whose realised drift is ~0
+    p = float(df["close"].iloc[-1])
+    odds = tm.simulate(df, 1, p, p * 0.97, p * 1.03, max_hold=40, n_paths=10_000)
+    assert odds.paths == 10_000
+    assert abs(odds.p_target + odds.p_stop + odds.p_neither - 1) < 1e-9
+    assert abs(odds.p_target - odds.p_stop) < 0.08       # no edge in a driftless walk
+
+
+def test_time_machine_sees_drift_and_is_repeatable():
+    up = _walk(drift=0.003)
+    p = float(up["close"].iloc[-1])
+    long_odds = tm.simulate(up, 1, p, p * 0.97, p * 1.03, 40)
+    short_odds = tm.simulate(up, -1, p, p * 1.03, p * 0.97, 40)
+    assert long_odds.p_target > long_odds.p_stop
+    assert short_odds.p_stop > short_odds.p_target
+    assert long_odds.exp_r > short_odds.exp_r
+    again = tm.simulate(up, 1, p, p * 0.97, p * 1.03, 40)
+    assert again.p_target == long_odds.p_target           # fixed seed -> same answer
+
+
+def test_time_machine_stop_hit_at_most_minus_one_r_unless_gap():
+    df = _walk(vol=0.002)                                  # tiny moves: no gaps through a 3% stop
+    p = float(df["close"].iloc[-1])
+    odds = tm.simulate(df, 1, p, p * 0.97, p * 1.20, 40)
+    assert odds.exp_r >= -1.0 - 1e-9
+
+
+def test_time_machine_odds_for_signal_and_calibration():
+    ind = add_indicators(_walk(drift=0.001))
+    cost = CostModel(spread_bps=2, slippage_bps=1)
+    sig = Signal(1, 2.0, NO_TARGET, 60, "test")          # no fixed target -> +2R proxy
+    odds = tm.odds_for(ind, sig, cost, strategy=TrendFollowing(), allow_short=False, n_paths=2000)
+    assert odds is not None and abs(odds.reward_risk - 2.0) < 1e-6
+    assert odds.hist_trades >= 0 and "time machine" in odds.describe()
+    f = tm.trade_fields(odds)
+    assert set(f) == {"tm_p_target", "tm_p_stop", "tm_exp_r"}
+    trades = [{"tm_p_target": 0.6, "tm_exp_r": 0.3, "r_multiple": 1.0},
+              {"tm_p_target": 0.62, "tm_exp_r": 0.3, "r_multiple": -1.0},
+              {"tm_p_target": 0.1, "tm_exp_r": -0.4, "r_multiple": -1.0},
+              {"tm_p_target": None, "r_multiple": 2.0}]
+    cal = tm.calibration(trades)
+    assert list(cal["forecast"]) == ["under 20%", "50-65%"]
+    assert cal.set_index("forecast").loc["50-65%", "actual_win_pct"] == 0.5
+
+
+def test_shadow_trades_carry_time_machine_odds(small_settings, store):
+    small_settings.raw["time_machine"] = {"enabled": True, "paths": 500, "shadow_paths": 300}
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    t = datetime(2025, 6, 2, 0, 7, tzinfo=UTC)
+    for d in range(40):
+        eng.cycle(t + timedelta(days=d))
+    sh = store.shadow_trades()
+    assert sh and all(s["tm_p_target"] is not None and 0 <= s["tm_p_target"] <= 1 for s in sh)
+    assert any("time machine" in s["note"] for s in sh)
