@@ -679,3 +679,82 @@ def test_engine_saves_account_risk_state(small_settings, store):
     eng.cycle(datetime(2025, 6, 2, 0, 7, tzinfo=UTC))
     st = json.loads(store.get_control("risk_state", "{}"))
     assert {"drawdown_pct", "loss_streak", "account_mult", "open_risk_gbp", "open_risk_cap_gbp"} <= set(st)
+
+
+# ---------------- v0.12: trade management ----------------
+from marketpilot.backtest import MANAGEMENT, new_state, step_position, trade_r
+
+_ZERO = CostModel()
+
+
+def _bar(o, h, l, c):
+    return {"open": o, "high": h, "low": l, "close": c, "atr14": 2.0}
+
+
+def _run_path(mode, bars, entry=100.0, stop=98.0, target=200.0):
+    sig = Signal(1, 1.0, NO_TARGET, 50, "t")
+    st = new_state(sig, stop, target, entry, entry - stop, MANAGEMENT[mode])
+    for k, b in enumerate(bars):
+        hit = step_position(st, b, _ZERO, entry_bar=(k == 0))
+        if hit:
+            return trade_r(st, 1, entry, hit[0], entry - stop, _ZERO), hit[1], st
+    return None, None, st
+
+
+# entry 100, risk 2: rallies to 102.5 (> +1R), then falls through the original stop
+_PATH = [_bar(100, 101, 99.5, 100.5), _bar(100.5, 102.6, 100.4, 102.5), _bar(102.4, 102.5, 97.0, 97.5)]
+
+
+def test_base_management_takes_full_loss():
+    r, reason, _ = _run_path("base", _PATH)
+    assert r == pytest.approx(-1.0) and reason == "stop"
+
+
+def test_breakeven_turns_the_loss_into_a_scratch():
+    r, reason, st = _run_path("breakeven", _PATH)
+    assert r == pytest.approx(0.0, abs=1e-9) and st["stop"] == pytest.approx(100.0)
+
+
+def test_partial_banks_half_at_one_r():
+    r, _, st = _run_path("partial", _PATH)
+    assert st["partial_price"] == pytest.approx(102.0)
+    assert r == pytest.approx(0.5)            # half at +1R, half at breakeven
+
+
+def test_management_never_moves_stop_backwards_and_handles_shorts():
+    sig = Signal(-1, 1.0, NO_TARGET, 50, "t")
+    st = new_state(sig, 102.0, 0.0, 100.0, 2.0, MANAGEMENT["breakeven"])
+    step_position(st, _bar(100, 100.5, 97.5, 97.8), _ZERO, entry_bar=True)   # +1.1R for a short
+    assert st["stop"] == pytest.approx(100.0)
+    st["stop"] = 99.0                                                       # tighter (e.g. trailing)
+    step_position(st, _bar(97.8, 98.0, 97.0, 97.2), _ZERO, entry_bar=False)
+    assert st["stop"] == pytest.approx(99.0)
+
+
+def test_backtest_records_all_management_modes_on_the_same_trades():
+    ind = add_indicators(_walk(drift=0.001, seed=3))
+    trades = run_backtest(ind, TrendFollowing(), _ZERO, False, compare_modes=("base", "breakeven", "partial"))
+    assert trades
+    for t in trades:
+        assert set(t.alt_r) == {"base", "breakeven", "partial"}
+        assert t.alt_r["base"] == pytest.approx(t.r_multiple)
+    from marketpilot.backtest import management_breakdown
+    mb = management_breakdown(trades, [], ("base", "breakeven", "partial"))
+    assert mb["breakeven"]["full_loss_rate"] <= mb["base"]["full_loss_rate"] + 1e-9
+
+
+def test_paper_broker_matches_backtest_partial_across_cycles(store):
+    from marketpilot.bots.autotrader import PaperBroker
+    idx = pd.date_range("2026-01-05", periods=4, freq="D", tz="UTC")
+    bars = pd.DataFrame([_bar(100, 100.5, 99.8, 100.2), _bar(100.2, 101, 99.5, 100.5),
+                         _bar(100.5, 102.6, 100.4, 102.5), _bar(102.4, 102.5, 97.0, 97.5)], index=idx)
+    pb = PaperBroker(store)
+    sig = Signal(1, 1.0, NO_TARGET, 50, "t")
+    pb.submit(candidate_id="c1", symbol="XYZ", asset_class="stocks", strategy_key="s", signal=sig,
+              regime="trending", bar_time=idx[0], atr=2.0, qty=1.0, risk_gbp=2.0, risk_per_unit=2.0, fx=1.0,
+              notional=100.0, cost_r=0.0, extra={"mgmt": "partial"})
+    pb.process("XYZ", bars.iloc[:3], "1d", _ZERO, idx[2], log=lambda *a, **k: None)   # cycle 1: partial taken
+    t = store.trades()[0]
+    assert t["status"] == "open" and t["partial_price"] == pytest.approx(102.2)   # entry 100.2 + 1R
+    closed = pb.process("XYZ", bars, "1d", _ZERO, idx[3], log=lambda *a, **k: None)   # cycle 2: rest stopped
+    assert closed and closed[0]["r_multiple"] == pytest.approx(0.5)
