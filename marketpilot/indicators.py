@@ -62,5 +62,17 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["dc55_low"] = out["low"].rolling(55).min().shift(1)
     out["hi252"] = out["high"].rolling(252, min_periods=252).max()
     out["lo252"] = out["low"].rolling(252, min_periods=252).min()
+    # Stochastic RSI (14,14,3,3) — used by the CCU "3 checkmarks" bottom signal
+    r14 = out["rsi14"]
+    lo, hi = r14.rolling(14).min(), r14.rolling(14).max()
+    out["stoch_k"] = (100 * (r14 - lo) / (hi - lo).replace(0, np.nan)).rolling(3).mean()
+    out["stoch_d"] = out["stoch_k"].rolling(3).mean()
+    # market structure: recent swing low/high (for structure-based stops) and the
+    # 60-bar swing range (for Fibonacci retracement zones)
+    out["swing_lo10"] = out["low"].rolling(10).min()
+    out["swing_hi10"] = out["high"].rolling(10).max()
+    out["range_hi60"] = out["high"].rolling(60).max()
+    out["range_lo60"] = out["low"].rolling(60).min()
+    out["vol_avg20"] = out["volume"].rolling(20, min_periods=5).mean()
     out["dollar_vol"] = (c * out["volume"]).rolling(20, min_periods=5).mean()
     return out

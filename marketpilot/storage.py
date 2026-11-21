@@ -28,12 +28,17 @@ TABLES = {
         closed_at TEXT, exit_price REAL, exit_reason TEXT, pnl_gbp REAL, fees_gbp REAL,
         r_multiple REAL, last_bar_time TEXT, signal_bar_time TEXT, atr REAL,
         stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT, trail_atr REAL,
-        exit_ma INTEGER, exit_on TEXT, best_price REAL""",
+        exit_ma INTEGER, exit_on TEXT, best_price REAL, stop_swing INTEGER, swing_level REAL,
+        confluence INTEGER""",
     "mp_shadow_trades": None,  # filled below: same columns as mp_trades
     "mp_strategies": """
         strategy_id TEXT PRIMARY KEY, symbol TEXT, asset_class TEXT, strategy TEXT,
         family TEXT, params TEXT, status TEXT, reasons TEXT, oos TEXT, holdout TEXT,
         avg_cost_r REAL, researched_at TEXT, data_start TEXT, data_end TEXT""",
+    "mp_market": """
+        symbol TEXT PRIMARY KEY, asset_class TEXT, ts TEXT, bar_time TEXT, price REAL, chg_1d REAL,
+        chg_5d REAL, chg_20d REAL, above_200d INTEGER, rsi14 REAL, regime TEXT, atr_pct REAL,
+        conf_long INTEGER, conf_short INTEGER""",
     "mp_equity": """
         ts TEXT PRIMARY KEY, equity_gbp REAL, realized_gbp REAL, open_positions INTEGER""",
     "mp_events": """
@@ -104,6 +109,13 @@ class BaseStore:
     def shadow_trades(self, status: str | None = None) -> list[dict]:
         where = {"status": status} if status else None
         return self._select("mp_shadow_trades", where, order="opened_at", desc=True)
+
+    # --- market overview snapshot (one row per symbol, refreshed each cycle) ---
+    def save_market(self, row: dict) -> None:
+        self._upsert("mp_market", row, "symbol")
+
+    def market(self) -> list[dict]:
+        return self._select("mp_market")
 
     def save_strategy(self, row: dict) -> None:
         self._upsert("mp_strategies", _enc(row), "strategy_id")

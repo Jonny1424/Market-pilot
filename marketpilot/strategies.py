@@ -30,6 +30,8 @@ class Signal:
     exit_ma: int = 0          # >0: close-based exit vs SMA(exit_ma)
     exit_on: str = ""         # "revert": exit when close crosses MA in our favour
                               # "break":  exit when close crosses MA against us
+    stop_swing: bool = False  # True: stop goes beyond the recent 10-bar swing low/high
+                              # (market-structure stop, as discretionary traders place it)
 
 
 class Strategy:
@@ -85,7 +87,7 @@ class Breakout(Strategy):
     """20-bar Donchian channel breakout."""
     name, family = "breakout_donchian", "breakout"
     regimes = frozenset({"trending", "volatile"})
-    grid = {"stop": [1.5, 2.5], "target": [4.0, NO_TARGET], "trail": [0.0, 3.0]}
+    grid = {"stop": [1.5, 2.5], "target": [4.0, NO_TARGET], "trail": [0.0, 3.0], "swing": [0, 1]}
 
     def signal(self, prev, row):
         if _na(row["dc_high"], prev["dc_high"], row["atr14"]):
@@ -94,9 +96,11 @@ class Breakout(Strategy):
         if p["target"] >= NO_TARGET and p["trail"] == 0:
             return None
         if row["close"] > row["dc_high"] and prev["close"] <= prev["dc_high"]:
-            return Signal(1, p["stop"], p["target"], 40, "close broke 20-bar high", trail_atr=p["trail"])
+            return Signal(1, p["stop"], p["target"], 40, "close broke 20-bar high", trail_atr=p["trail"],
+                          stop_swing=bool(p.get("swing", 0)))
         if row["close"] < row["dc_low"] and prev["close"] >= prev["dc_low"]:
-            return Signal(-1, p["stop"], p["target"], 40, "close broke 20-bar low", trail_atr=p["trail"])
+            return Signal(-1, p["stop"], p["target"], 40, "close broke 20-bar low", trail_atr=p["trail"],
+                          stop_swing=bool(p.get("swing", 0)))
         return None
 
 
@@ -126,16 +130,18 @@ class MomentumPullback(Strategy):
     momentum positive) when RSI14 recovers back through the threshold."""
     name, family = "momentum_pullback", "momentum"
     regimes = frozenset({"trending", "ranging"})
-    grid = {"stop": [2.0, 3.0], "target": [3.0, 4.5], "rsi": [45]}
+    grid = {"stop": [2.0, 3.0], "target": [3.0, 4.5], "rsi": [45], "swing": [0, 1]}
 
     def signal(self, prev, row):
         if _na(row["ema50"], row["roc20"], prev["rsi14"]):
             return None
         p, lvl = self.params, self.params["rsi"]
         if row["ema20"] > row["ema50"] and row["roc20"] > 0 and prev["rsi14"] < lvl <= row["rsi14"]:
-            return Signal(1, p["stop"], p["target"], 30, "uptrend pullback, RSI14 recovered")
+            return Signal(1, p["stop"], p["target"], 30, "uptrend pullback, RSI14 recovered",
+                          stop_swing=bool(p.get("swing", 0)))
         if row["ema20"] < row["ema50"] and row["roc20"] < 0 and prev["rsi14"] > 100 - lvl >= row["rsi14"]:
-            return Signal(-1, p["stop"], p["target"], 30, "downtrend bounce, RSI14 rolled over")
+            return Signal(-1, p["stop"], p["target"], 30, "downtrend bounce, RSI14 rolled over",
+                          stop_swing=bool(p.get("swing", 0)))
         return None
 
 
@@ -186,16 +192,18 @@ class Turtle55(Strategy):
     bars; protect with a 2-ATR stop that trails behind the best close."""
     name, family = "turtle_55", "breakout"
     regimes = frozenset({"trending", "volatile", "ranging"})
-    grid = {"stop": [2.0, 3.0], "trail": [3.0, 4.5]}
+    grid = {"stop": [2.0, 3.0], "trail": [3.0, 4.5], "swing": [0, 1]}
 
     def signal(self, prev, row):
         if _na(row["dc55_high"], prev["dc55_high"], row["atr14"]):
             return None
         p = self.params
         if row["close"] > row["dc55_high"] and prev["close"] <= prev["dc55_high"]:
-            return Signal(1, p["stop"], NO_TARGET, 120, "close broke 55-bar high", trail_atr=p["trail"])
+            return Signal(1, p["stop"], NO_TARGET, 120, "close broke 55-bar high", trail_atr=p["trail"],
+                          stop_swing=bool(p.get("swing", 0)))
         if row["close"] < row["dc55_low"] and prev["close"] >= prev["dc55_low"]:
-            return Signal(-1, p["stop"], NO_TARGET, 120, "close broke 55-bar low", trail_atr=p["trail"])
+            return Signal(-1, p["stop"], NO_TARGET, 120, "close broke 55-bar low", trail_atr=p["trail"],
+                          stop_swing=bool(p.get("swing", 0)))
         return None
 
 
@@ -240,8 +248,30 @@ class High52Week(Strategy):
         return None
 
 
+class CCUBottom(Strategy):
+    """"3 checkmarks" capitulation buy, as published by Steve Courtney (Crypto Crew
+    University) for Bitcoin on the 2-day chart: price below its 200 MA, RSI(14)
+    below 26 and both Stochastic RSI lines below 20. Tested here on daily bars for
+    every market; exit on a close back above the 20-day average, a wide stop or
+    after 60 bars. Long only (it is a bottom-fishing signal)."""
+    name, family = "ccu_3checkmarks", "capitulation reversal"
+    regimes = frozenset({"ranging", "trending", "volatile"})
+    grid = {"rsi": [26.0, 30.0], "stop": [3.0, 4.5]}
+
+    def signal(self, prev, row):
+        if _na(row["sma200"], row["rsi14"], row["stoch_k"], row["stoch_d"], row["atr14"]):
+            return None
+        p = self.params
+        fresh = not (prev["rsi14"] < p["rsi"] and prev["stoch_k"] < 20 and prev["stoch_d"] < 20)
+        if (row["close"] < row["sma200"] and row["rsi14"] < p["rsi"] and row["stoch_k"] < 20
+                and row["stoch_d"] < 20 and fresh):
+            return Signal(1, p["stop"], NO_TARGET, 60, "3 checkmarks: below 200 MA, RSI & StochRSI oversold",
+                          exit_ma=20, exit_on="revert")
+        return None
+
+
 ALL_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback,
-                                        BollingerReversion, Turtle55, MACDTrend, High52Week]
+                                        BollingerReversion, Turtle55, MACDTrend, High52Week, CCUBottom]
 
 
 def strategy_from_key(key: str) -> Strategy:

@@ -15,7 +15,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from . import notify
-from .backtest import plan_levels
+from .backtest import plan_levels, swing_level
+from .bots import confluence as conf
 from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
 from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
@@ -116,6 +117,9 @@ class Engine:
                 continue
             last_prices[symbol] = float(df["close"].iloc[-1])
             ind = add_indicators(df)
+            mf_state = (filters.get(cls) or {}).get("ok")
+            if tradable:
+                self._snapshot(symbol, cls, ind, mf_state)
 
             closed = self.broker.process(symbol, ind, interval, cost, now_ts, self.log)
             summary["closed"] += len(closed)
@@ -125,7 +129,7 @@ class Engine:
                                                                     lambda *a, **k: None))
                 if tradable:
                     summary["shadow_opened"] += shadow_signals(self.shadow_view, self.shadow, symbol, cls, ind,
-                                                               classify_row(ind.iloc[-1]), shadow_params)
+                                                               classify_row(ind.iloc[-1]), shadow_params, mf_state)
 
             if not tradable or symbol not in approved:
                 continue
@@ -153,9 +157,14 @@ class Engine:
                     news = news + [f"market filter: {mf['symbol']} is below its 200-day average"]
                 live_r = [float(t["r_multiple"]) for t in self.store.trades("closed")
                           if t["symbol"] == symbol and t["strategy"] == strat.key]
+                c_score, c_hits = conf.score(row, sig.direction, None if not mf else mf["ok"])
                 dec = self.decider.decide(approval=appr, regime=regime, strategy_regimes=strat.regimes,
                                           scan=snap, news_vetoes=news, live_r=live_r)
                 reasons = list(dec.reasons)
+                min_conf = int(self.s.raw.get("confluence", {}).get("min_score", 0))
+                if min_conf and c_score < min_conf:
+                    reasons.append(f"confluence {c_score}/{conf.MAX_SCORE} below minimum {min_conf}")
+                    dec.trade = False
                 risk_res = None
                 rpu = None
                 if dec.trade:
@@ -163,7 +172,8 @@ class Engine:
                     eq, _ = self.equity(trades, last_prices)
                     pnl_today, n_today = realized_today(trades, now_ts)
                     entry_est = cost.market_fill(float(row["close"]), sig.direction)
-                    _, _, rpu = plan_levels(entry_est, float(row["atr14"]), sig, cost)
+                    _, _, rpu = plan_levels(entry_est, float(row["atr14"]), sig, cost,
+                                            swing_level(row, sig.direction))
                     risk_res = self.risk.evaluate(
                         symbol=symbol, asset_class=cls, equity=eq, realized_today=pnl_today,
                         trades_today=n_today, open_trades=[t for t in trades if t["status"] in ("open", "pending")],
@@ -171,7 +181,8 @@ class Engine:
                         kill_switch=self.safety.kill_switch_on())
                     reasons += risk_res.reasons
                 go = dec.trade and risk_res is not None and risk_res.ok
-                evidence = {**dec.evidence, "signal": sig.note}
+                evidence = {**dec.evidence, "signal": sig.note, "confluence": c_score,
+                            "confluence_factors": c_hits}
                 if risk_res is not None:
                     evidence.update({"qty": risk_res.quantity, "risk_gbp": risk_res.risk_gbp,
                                      "notional_gbp": risk_res.notional_gbp, "cost_r": risk_res.cost_r})
@@ -185,13 +196,17 @@ class Engine:
                                        strategy_key=strat.key, signal=sig, regime=regime, bar_time=bar_time,
                                        atr=float(row["atr14"]), qty=risk_res.quantity,
                                        risk_gbp=risk_res.risk_gbp, risk_per_unit=rpu, fx=fx,
-                                       notional=risk_res.notional_gbp, cost_r=risk_res.cost_r)
+                                       notional=risk_res.notional_gbp, cost_r=risk_res.cost_r,
+                                       swing=swing_level(row, sig.direction), confluence=c_score,
+                                       conf_text=conf.describe(c_hits))
                     summary["new_orders"] += 1
                     self.log("trade_decision", f"ORDER {symbol} {'LONG' if sig.direction > 0 else 'SHORT'} "
                              f"[{strat.key}] EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}")
                 else:
                     summary["rejected"] += 1
 
+        if self.live:
+            self._fear_greed()
         self.safety.end_of_cycle(summary["failed_feeds"], len(symbols), self._ts)
         trades = self.store.trades()
         eq, realized = self.equity(trades, last_prices)
@@ -212,6 +227,38 @@ class Engine:
         self._daily_summary(now_ts, trades, eq, n_open)
         summary["equity"] = eq
         return summary
+
+    def _snapshot(self, symbol: str, cls: str, ind, market_ok) -> None:
+        """Market overview row for the dashboard's Markets tab."""
+        try:
+            row = ind.iloc[-1]
+            c = ind["close"]
+
+            def chg(n):
+                return float(c.iloc[-1] / c.iloc[-1 - n] - 1) if len(c) > n else None
+            cl, _ = conf.score(row, 1, market_ok)
+            cs, _ = conf.score(row, -1, market_ok)
+            self.store.save_market({
+                "symbol": symbol, "asset_class": cls, "ts": self._ts, "bar_time": str(ind.index[-1]),
+                "price": float(row["close"]), "chg_1d": chg(1), "chg_5d": chg(5), "chg_20d": chg(20),
+                "above_200d": None if pd.isna(row["sma200"]) else int(row["close"] > row["sma200"]),
+                "rsi14": float(row["rsi14"]), "regime": classify_row(row),
+                "atr_pct": None if pd.isna(row["atr_pct"]) else float(row["atr_pct"]),
+                "conf_long": cl, "conf_short": cs})
+        except Exception as exc:  # the overview must never break trading
+            self.log("monitoring", f"{symbol}: market snapshot failed ({type(exc).__name__})", "warning")
+
+    def _fear_greed(self) -> None:
+        """Crypto Fear & Greed Index (alternative.me) — recorded as learning data, not a signal."""
+        try:
+            import json
+
+            import requests
+            r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10).json()["data"][0]
+            self.store.set_control("fear_greed", json.dumps(
+                {"value": int(r["value"]), "label": r["value_classification"], "ts": self._ts}))
+        except Exception:
+            pass
 
     def _daily_summary(self, now_ts: pd.Timestamp, trades, eq: float, n_open: int) -> None:
         hour = int(self.s.raw.get("notifications", {}).get("daily_summary_hour_utc", 21))

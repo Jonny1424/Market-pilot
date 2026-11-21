@@ -20,6 +20,8 @@ import pandas as pd
 from .costs import CostModel
 from .indicators import add_indicators
 from .metrics import summarize
+from .bots.confluence import bucket as conf_bucket
+from .bots.confluence import score as conf_score
 from .strategies import Signal, Strategy
 
 
@@ -37,12 +39,31 @@ class SimTrade:
     exit_reason: str = ""
     r_multiple: float = 0.0
     cost_r: float = 0.0
+    confluence: int = 0
 
 
-def plan_levels(entry_fill: float, atr: float, sig: Signal, cost: CostModel) -> tuple[float, float, float]:
-    """Return (stop, target, risk_per_unit) for an entry."""
+def swing_level(row, direction: int):
+    """Recent 10-bar swing low (longs) / high (shorts) at the signal bar."""
+    v = row.get("swing_lo10") if direction == 1 else row.get("swing_hi10")
+    try:
+        return None if v is None or np.isnan(float(v)) else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def plan_levels(entry_fill: float, atr: float, sig: Signal, cost: CostModel,
+                swing: float | None = None) -> tuple[float, float, float]:
+    """Return (stop, target, risk_per_unit) for an entry.
+
+    ATR stop by default. With sig.stop_swing, the stop goes 0.5 ATR beyond the
+    recent swing low/high (market structure), clamped to 1-4 ATR from entry so it
+    is never absurdly tight or wide."""
     d = sig.direction
     stop = entry_fill - d * sig.stop_atr * atr
+    if getattr(sig, "stop_swing", False) and swing is not None and atr > 0:
+        dist = d * (entry_fill - (swing - d * 0.5 * atr))
+        dist = min(max(dist, 1.0 * atr), 4.0 * atr)
+        stop = entry_fill - d * dist
     target = entry_fill + d * sig.target_atr * atr
     exit_cost = stop * (cost.half_spread + cost.slip) + cost.commission_per_unit(stop)
     risk_per_unit = abs(entry_fill - stop) + exit_cost + cost.commission_per_unit(entry_fill)
@@ -162,8 +183,9 @@ def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_s
             continue
         e = i + 1
         entry = cost.market_fill(rows[e]["open"], sig.direction)
-        stop, target, rpu = plan_levels(entry, row["atr14"], sig, cost)
+        stop, target, rpu = plan_levels(entry, row["atr14"], sig, cost, swing_level(row, sig.direction))
         t = SimTrade(strategy.key, sig.direction, idx[i], idx[e], entry, stop, target)
+        t.confluence = conf_score(row, sig.direction, None if mk is None else bool(mk[i]))[0]
         st = new_state(sig, stop, target)
         j = e
         while j < n:
@@ -251,8 +273,21 @@ def walk_forward(df: pd.DataFrame, strategy_cls: type[Strategy], cost: CostModel
         "oos_trades": oos,
         "holdout_trades": holdout,
         "avg_cost_r": float(np.mean([t.cost_r for t in oos])) if oos else 0.0,
+        "by_confluence": confluence_breakdown(oos),
         "data_start": str(ts[0]), "data_end": str(ts[-1]), "bars": n,
     }
+
+
+def confluence_breakdown(trades: list[SimTrade]) -> dict:
+    """Win rate / expectancy of trades grouped by confluence score bucket."""
+    groups: dict[str, list[float]] = {}
+    for t in trades:
+        groups.setdefault(conf_bucket(t.confluence), []).append(t.r_multiple)
+    out = {}
+    for b, rs in groups.items():
+        s = summarize(rs)
+        out[b] = {"trades": s["trades"], "win_rate": s["win_rate"], "expectancy_r": s["expectancy_r"]}
+    return out
 
 
 def passes_gate(result: dict, gate: dict) -> tuple[bool, list[str]]:
