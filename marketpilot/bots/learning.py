@@ -60,12 +60,13 @@ def researched_params(store) -> dict[str, str]:
 
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
                    regime: str, params: dict[str, str], market_ok: bool | None = None,
-                   cost=None, tm_paths: int = 0) -> int:
+                   cost=None, tm_paths: int = 0, cv_cfg: dict | None = None) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
     from ..backtest import swing_level
     from ..strategies import strategy_from_key
     from . import confluence as conf
+    from . import conviction as cv
     from . import timemachine as tm
 
     row, prev = ind.iloc[-1], ind.iloc[-2]
@@ -92,7 +93,8 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
             atr=float(row["atr14"]), qty=0.0, risk_gbp=1.0, risk_per_unit=1.0, fx=1.0,
             notional=0.0, cost_r=0.0, swing=swing_level(row, sig.direction),
             confluence=(cs := conf.score(row, sig.direction, market_ok))[0], conf_text=conf.describe(cs[1]),
-            extra=tm.trade_fields(odds), extra_note=odds.describe() if odds else "")
+            extra={**tm.trade_fields(odds), "grade": (g := cv.grade(cs[0], odds, cv_cfg))},
+            extra_note=cv.describe(g, cs[0], odds) + (f" | {odds.describe()}" if odds else ""))
         opened += int(bool(ok))
     return opened
 

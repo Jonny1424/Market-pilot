@@ -61,7 +61,9 @@ def score(row, direction: int, market_ok: bool | None = None) -> tuple[int, list
     rank = row.get("atr_pct_rank")
     if _ok(rank) and rank < 0.8:
         hits.append("calm")
-    if market_ok is True:          # None = this market group has no benchmark filter
+    # market_ok = benchmark above its 200-day average (None = no benchmark for this group).
+    # Longs agree with a rising benchmark, shorts with a falling one.
+    if (market_ok is True and d == 1) or (market_ok is False and d == -1):
         hits.append("market")
     return len(hits), hits
 
