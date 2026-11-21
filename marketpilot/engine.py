@@ -59,7 +59,8 @@ class Engine:
         self.news = NewsBot(settings, live)
         self.risk = RiskManager(settings)
         self.decider = DecisionBot(settings)
-        self.broker = PaperBroker(store, on_open=notify.trade_opened, on_close=notify.trade_closed)
+        self.broker = PaperBroker(store, on_open=notify.trade_opened, on_close=notify.trade_closed,
+                                  on_partial=notify.partial_taken)
         self.shadow_view = ShadowView(store)
         self.shadow = PaperBroker(self.shadow_view)          # Learning Lab: no alerts
         self.learning_on = bool(settings.raw.get("learning", {}).get("enabled", True))
@@ -143,7 +144,8 @@ class Engine:
                     summary["shadow_opened"] += shadow_signals(self.shadow_view, self.shadow, symbol, cls, ind,
                                                                classify_row(ind.iloc[-1]), shadow_params, mf_state,
                                                                cost=cost, tm_paths=self._shadow_tm_paths(),
-                                                               cv_cfg=self.s.raw.get("conviction", {}))
+                                                               cv_cfg=self.s.raw.get("conviction", {}),
+                                                               mgmt=self._mgmt())
 
             if not tradable or symbol not in approved:
                 continue
@@ -230,7 +232,8 @@ class Engine:
                                        risk_gbp=risk_res.risk_gbp, risk_per_unit=rpu, fx=fx,
                                        notional=risk_res.notional_gbp, cost_r=risk_res.cost_r,
                                        swing=swing_level(row, sig.direction), confluence=c_score,
-                                       conf_text=conf.describe(c_hits), extra={**tm.trade_fields(odds), "grade": c_grade},
+                                       conf_text=conf.describe(c_hits),
+                                       extra={**tm.trade_fields(odds), "grade": c_grade, "mgmt": self._mgmt()},
                                        extra_note=cv.describe(c_grade, c_score, odds)
                                        + (f" | {odds.describe()}" if odds else "")
                                        + (f" | risk {risk_res.risk_mult:.2g}x: {', '.join(risk_res.risk_notes)}"
@@ -299,6 +302,9 @@ class Engine:
                 {"value": int(r["value"]), "label": r["value_classification"], "ts": self._ts}))
         except Exception:
             pass
+
+    def _mgmt(self) -> str:
+        return (self.s.raw.get("trade_management") or {}).get("mode", "base")
 
     def _save_risk_state(self, last_prices) -> None:
         try:

@@ -12,7 +12,7 @@ R = net P&L / planned risk, where planned risk includes estimated exit costs.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,7 @@ class SimTrade:
     cost_r: float = 0.0
     confluence: int = 0
     vol_rank: float | None = None
+    alt_r: dict = field(default_factory=dict)   # R under other trade-management modes
 
 
 def swing_level(row, direction: int):
@@ -113,6 +114,28 @@ def _entry_bar_exit(bar, direction, stop, target, cost):
     return None
 
 
+# Trade management (v0.12). How an open trade is handled once it moves in our favour.
+#   base       stops/targets/trailing exactly as each strategy defines them
+#   breakeven  once a bar closes 1R in profit, the stop moves to breakeven (entry + costs)
+#   partial    bank half the position at +1R, then move the rest's stop to breakeven
+MANAGEMENT = {
+    "base": {},
+    "breakeven": {"be_at_r": 1.0},
+    "partial": {"partial_at_r": 1.0, "partial_frac": 0.5, "be_after_partial": True},
+}
+
+
+def _be_level(st: dict, cost: CostModel) -> float:
+    """Stop price that exits at about 0R after spreads, slippage and commission."""
+    e, d = st["entry"], int(st["direction"])
+    return e + d * cost.round_trip_cost_frac() * e
+
+
+def _raise_stop(st: dict, level: float) -> None:
+    d = int(st["direction"])
+    st["stop"] = max(st["stop"], level) if d == 1 else min(st["stop"], level)
+
+
 def step_position(st: dict, row, cost: CostModel, entry_bar: bool) -> tuple[float, str] | None:
     """Advance an open position by one bar. Mutates `st` (stop, best, held).
 
@@ -123,6 +146,16 @@ def step_position(st: dict, row, cost: CostModel, entry_bar: bool) -> tuple[floa
     hit = (_entry_bar_exit if entry_bar else check_exit)(row, d, st["stop"], st["target"], cost)
     if hit:
         return hit
+    m = st.get("mgmt") or {}
+    rpu, entry = st.get("rpu"), st.get("entry")
+    if m.get("partial_at_r") and rpu and entry and st.get("partial_price") is None:
+        level = entry + d * m["partial_at_r"] * rpu
+        o, h, lo_ = row["open"], row["high"], row["low"]
+        if (d == 1 and h >= level) or (d == -1 and lo_ <= level):
+            px = o if d * (o - level) >= 0 and not entry_bar else level   # gap through the level: fill at open
+            st["partial_price"] = cost.market_fill(px, -d)
+            if m.get("be_after_partial"):
+                _raise_stop(st, _be_level(st, cost))
     close = row["close"]
     ma_n = int(st.get("exit_ma") or 0)
     if ma_n:
@@ -142,8 +175,21 @@ def step_position(st: dict, row, cost: CostModel, entry_bar: bool) -> tuple[floa
     if trail > 0 and atr is not None and np.isfinite(atr):
         new_stop = best - d * trail * atr
         st["stop"] = max(st["stop"], new_stop) if d == 1 else min(st["stop"], new_stop)
+    if m.get("be_at_r") and rpu and entry and d * (close - entry) >= m["be_at_r"] * rpu:
+        _raise_stop(st, _be_level(st, cost))
     st["held"] += 1
     return None
+
+
+def trade_r(st: dict, direction: int, entry: float, exit_px: float, rpu: float, cost: CostModel) -> float:
+    """Net R of a closed trade, blending in any partial profit banked earlier."""
+    r_exit, _ = realized_r(direction, entry, exit_px, rpu, cost)
+    pp = st.get("partial_price")
+    if pp is None:
+        return r_exit
+    f = float((st.get("mgmt") or {}).get("partial_frac", 0.5))
+    r_part, _ = realized_r(direction, entry, pp, rpu, cost)
+    return (1 - f) * r_exit + f * r_part
 
 
 def realized_r(direction: int, entry: float, exit_: float, risk_per_unit: float,
@@ -154,15 +200,30 @@ def realized_r(direction: int, entry: float, exit_: float, risk_per_unit: float,
     return net / risk_per_unit, 0.0 if risk_per_unit == 0 else commissions / risk_per_unit
 
 
-def new_state(sig: Signal, stop: float, target: float) -> dict:
+def new_state(sig: Signal, stop: float, target: float, entry: float | None = None,
+              rpu: float | None = None, mgmt: dict | None = None) -> dict:
     return {"direction": sig.direction, "stop": stop, "target": target, "held": 0,
             "max_hold": sig.max_hold, "trail_atr": sig.trail_atr, "exit_ma": sig.exit_ma,
-            "exit_on": sig.exit_on, "best": None}
+            "exit_on": sig.exit_on, "best": None, "entry": entry, "rpu": rpu,
+            "mgmt": mgmt or {}, "partial_price": None}
+
+
+def _simulate_exit(rows, e: int, sig: Signal, stop: float, target: float, entry: float, rpu: float,
+                   cost: CostModel, mgmt: dict | None):
+    st = new_state(sig, stop, target, entry, rpu, mgmt)
+    j, n = e, len(rows)
+    while j < n:
+        hit = step_position(st, rows[j], cost, entry_bar=(j == e))
+        if hit:
+            return j, hit, st
+        j += 1
+    return None, None, st
 
 
 def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_short: bool,
                  start: pd.Timestamp | None = None, end: pd.Timestamp | None = None,
-                 regime: pd.Series | None = None, market_ok: pd.Series | None = None) -> list[SimTrade]:
+                 regime: pd.Series | None = None, market_ok: pd.Series | None = None,
+                 mgmt: str = "base", compare_modes: tuple[str, ...] = ()) -> list[SimTrade]:
     """Simulate one strategy on one symbol. `ind` must come from add_indicators().
     Only signals with signal_time in [start, end) are taken; one position at a time.
     `market_ok` (bool series on the same index) blocks LONG entries when False."""
@@ -189,18 +250,19 @@ def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_s
         t.confluence = conf_score(row, sig.direction, None if mk is None else bool(mk[i]))[0]
         vr = row.get("atr_pct_rank")
         t.vol_rank = float(vr) if vr is not None and np.isfinite(vr) else None
-        st = new_state(sig, stop, target)
-        j = e
-        while j < n:
-            hit = step_position(st, rows[j], cost, entry_bar=(j == e))
-            if hit:
-                t.exit_price, t.exit_reason = hit
-                break
-            j += 1
-        if t.exit_price is None:  # still open at end of data: ignore
+        j, hit, st = _simulate_exit(rows, e, sig, stop, target, entry, rpu, cost, MANAGEMENT.get(mgmt, {}))
+        if hit is None:  # still open at end of data: ignore
             break
+        t.exit_price, t.exit_reason = hit
         t.exit_time = idx[j]
-        t.r_multiple, _ = realized_r(sig.direction, entry, t.exit_price, rpu, cost)
+        t.r_multiple = trade_r(st, sig.direction, entry, t.exit_price, rpu, cost)
+        for mode in compare_modes:   # same entry, different management: for the research comparison
+            if mode == mgmt:
+                t.alt_r[mode] = t.r_multiple
+                continue
+            _, h2, st2 = _simulate_exit(rows, e, sig, stop, target, entry, rpu, cost, MANAGEMENT.get(mode, {}))
+            if h2 is not None:
+                t.alt_r[mode] = trade_r(st2, sig.direction, entry, h2[0], rpu, cost)
         t.cost_r = cost.round_trip_cost_frac() * entry / rpu
         trades.append(t)
         i = j + 1
@@ -229,7 +291,8 @@ def market_filter_series(filter_df: pd.DataFrame | None, index: pd.DatetimeIndex
 
 def walk_forward(df: pd.DataFrame, strategy_cls: type[Strategy], cost: CostModel,
                  allow_short: bool, folds: int = 4, holdout_fraction: float = 0.2,
-                 min_is_trades: int = 5, market_ok: pd.Series | None = None) -> dict:
+                 min_is_trades: int = 5, market_ok: pd.Series | None = None,
+                 mgmt: str = "base", compare_modes: tuple[str, ...] = ()) -> dict:
     """Anchored walk-forward with a final untouched holdout.
 
     For each fold: pick the parameter variant with the best in-sample expectancy,
@@ -249,7 +312,7 @@ def walk_forward(df: pd.DataFrame, strategy_cls: type[Strategy], cost: CostModel
     def best_on(a, b):
         best, best_e = None, -np.inf
         for v in variants:
-            tr = run_backtest(ind, v, cost, allow_short, ts[a], ts[b], regime, market_ok)
+            tr = run_backtest(ind, v, cost, allow_short, ts[a], ts[b], regime, market_ok, mgmt)
             if len(tr) < min_is_trades:
                 continue
             e = np.mean([t.r_multiple for t in tr])
@@ -262,10 +325,12 @@ def walk_forward(df: pd.DataFrame, strategy_cls: type[Strategy], cost: CostModel
         if pick is None:
             continue
         chosen.append(pick.key)
-        oos += run_backtest(ind, pick, cost, allow_short, ts[edges[k]], ts[edges[k + 1]], regime, market_ok)
+        oos += run_backtest(ind, pick, cost, allow_short, ts[edges[k]], ts[edges[k + 1]], regime, market_ok,
+                            mgmt, compare_modes)
 
     final = best_on(edges[0], hold_start) or variants[0]
-    holdout = run_backtest(ind, final, cost, allow_short, ts[hold_start], None, regime, market_ok)
+    holdout = run_backtest(ind, final, cost, allow_short, ts[hold_start], None, regime, market_ok,
+                           mgmt, compare_modes)
     return {
         "strategy": strategy_cls.name,
         "family": strategy_cls.family,
@@ -277,8 +342,28 @@ def walk_forward(df: pd.DataFrame, strategy_cls: type[Strategy], cost: CostModel
         "holdout_trades": holdout,
         "avg_cost_r": float(np.mean([t.cost_r for t in oos])) if oos else 0.0,
         "by_confluence": confluence_breakdown(oos),
+        "management": management_breakdown(oos, holdout, compare_modes),
         "data_start": str(ts[0]), "data_end": str(ts[-1]), "bars": n,
     }
+
+
+def management_breakdown(oos: list[SimTrade], holdout: list[SimTrade], modes) -> dict:
+    """Same trades under each management mode: expectancy, loss rate, drawdown."""
+    out = {}
+    for mode in modes:
+        o = [t.alt_r[mode] for t in oos if mode in t.alt_r]
+        h = [t.alt_r[mode] for t in holdout if mode in t.alt_r]
+        if not o:
+            continue
+        so, sh = summarize(o), summarize(h)
+        full_losses = sum(1 for r in o if r <= -0.9)
+        scratches = sum(1 for r in o if abs(r) < 0.15)
+        out[mode] = {"trades": so["trades"], "expectancy_r": so["expectancy_r"], "win_rate": so["win_rate"],
+                     "loss_rate": 1 - so["win_rate"], "full_loss_rate": full_losses / len(o), "scratch_rate": scratches / len(o),
+                     "avg_loss_r": so["avg_loss_r"], "max_drawdown_r": so["max_drawdown_r"],
+                     "profit_factor": so["profit_factor"], "t_stat": so["t_stat"],
+                     "holdout_expectancy_r": sh["expectancy_r"]}
+    return out
 
 
 def confluence_breakdown(trades: list[SimTrade]) -> dict:

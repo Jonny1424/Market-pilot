@@ -37,6 +37,14 @@ def trade_opened(t: dict) -> None:
          tags="arrow_forward")
 
 
+def partial_taken(t: dict, st: dict) -> None:
+    side = "LONG" if int(t["direction"]) > 0 else "SHORT"
+    f = float((st.get("mgmt") or {}).get("partial_frac", 0.5))
+    send(f"Partial profit: {t['symbol']} {side}",
+         f"Banked {f:.0%} at {float(st['partial_price']):.4f} (+1R). Stop on the rest moved to breakeven "
+         f"({float(st['stop']):.4f}).", tags="moneybag")
+
+
 def trade_closed(t: dict) -> None:
     win = float(t["r_multiple"]) > 0
     send(f"{'WIN' if win else 'LOSS'}: {t['symbol']} {float(t['r_multiple']):+.2f}R (£{float(t['pnl_gbp']):+.2f})",
