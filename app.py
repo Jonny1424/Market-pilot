@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="MarketPilot v0.7", page_icon="📈", layout="wide")
+st.set_page_config(page_title="MarketPilot v0.8", page_icon="📈", layout="wide")
 
 BLUE, ORANGE, GOOD, CRITICAL, MUTED, GRID = "#2a78d6", "#eb6834", "#0ca30c", "#d03b3b", "#898781", "#e1e0d9"
 
@@ -70,7 +70,7 @@ store, backend = get_store()
 start_bal = settings.account["starting_balance"]
 target_wr = settings["goals"]["target_win_rate"]
 
-st.title("📈 MarketPilot v0.7 — multi-agent paper trading")
+st.title("📈 MarketPilot v0.8 — multi-agent paper trading")
 kill = store.get_control("kill_switch", "off") == "on"
 c1, c2 = st.columns([3, 1])
 c1.caption(f"Storage: {backend} • Paper trading only — no live orders, no broker connection. Not financial advice.")
@@ -85,7 +85,7 @@ o = rep["overall"]
 closed = rep["closed"]
 
 tabs = st.tabs(["Overview", "Bot decisions", "Strategies", "Positions", "Trade log", "Bot activity", "Controls",
-                "Learning lab", "Learn"])
+                "Learning lab", "Learn", "Markets"])
 
 # ---------------- Overview ----------------
 with tabs[0]:
@@ -230,7 +230,7 @@ with tabs[4]:
         log["result"] = log["r_multiple"].apply(lambda r: "WIN" if r > 0 else "LOSS")
         log["side"] = log["direction"].map({1: "LONG", -1: "SHORT"})
         cols = ["closed_at", "symbol", "side", "strategy", "result", "r_multiple", "pnl_gbp", "fees_gbp",
-                "entry_price", "exit_price", "exit_reason", "regime"]
+                "entry_price", "exit_price", "exit_reason", "regime"] + (["note"] if "note" in log else [])
         st.dataframe(log[cols], hide_index=True, width="stretch",
                      column_config={"r_multiple": st.column_config.NumberColumn("R", format="%+.2f"),
                                     "pnl_gbp": st.column_config.NumberColumn("P&L £", format="%+.2f")})
@@ -325,6 +325,17 @@ with tabs[7]:
             st.plotly_chart(style(fig, 360, "expectancy (R per trade)"), width="stretch")
             st.caption("Bubble size = number of shadow trades. Top-right is the goal: high win rate AND positive "
                        "expectancy. Small bubbles are not yet evidence.")
+        from marketpilot.bots.learning import confluence_stats
+        cst = confluence_stats(store)
+        st.markdown("**Does confluence work?** Shadow results grouped by confluence score (0-8 factors agreeing)")
+        if cst.empty:
+            st.caption("Not enough closed shadow trades with a confluence score yet.")
+        else:
+            st.dataframe(cst[["confluence", "trades", "win_rate", "expectancy_r", "t_stat"]].style.format(
+                {"win_rate": "{:.0%}", "expectancy_r": "{:+.3f}", "t_stat": "{:.1f}"}), hide_index=True,
+                width="stretch")
+            st.caption("If high-confluence trades clearly win more (with enough trades), raise "
+                       "`confluence.min_score` in settings so the real paper account only takes them.")
         with st.expander("Open shadow positions"):
             op = shadow_all[shadow_all["status"].isin(["open", "pending"])]
             st.dataframe(op[["symbol", "asset_class", "strategy", "status", "opened_at", "entry_price", "stop"]],
@@ -350,6 +361,26 @@ with tabs[8]:
   would have been. That's why MarketPilot uses broad ETFs.
 - **Costs** — spreads, slippage and fees are charged on every simulated trade. Many strategies that look good
   before costs lose money after them.""")
+    st.markdown("### How professional traders plan a trade")
+    st.markdown("""
+- **Build a case, not a hunch.** Chart Champions' approach is to stack *layers of confluence* — trend,
+  key support/resistance, Fibonacci zones, market structure — and use indicators only as the last
+  confirmation. MarketPilot's **Confluence bot** scores every signal on 8 such factors (shown in each
+  trade's note) and the Learning lab measures whether higher scores really win more often.
+- **Bull and bear scenario.** Write down what would make you right *and* what would prove you wrong before
+  entering. The stop goes where the idea is proven wrong — not at a random amount.
+- **Structure stops.** Discretionary traders put stops just beyond the last swing low/high, with a small
+  buffer. MarketPilot now tests this ("swing" variants: 0.5 ATR beyond the 10-bar swing, kept between 1 and
+  4 ATR) against plain ATR stops and lets the data choose.
+- **Risk first.** Peter Brandt, a 40-year professional, says chart analysis matters less than risk
+  management: small fixed risk per trade, take partial profits, tighten stops as a trade works, and get out
+  of losers quickly. MarketPilot risks 0.5% per trade with a 2% daily loss limit.
+- **Capitulation buys.** Crypto Crew University's "3 checkmarks" buys Bitcoin when price is below its
+  200 MA, RSI(14) is under 26 and both Stochastic RSI lines are under 20 — MarketPilot tests it on every
+  market as the `ccu_3checkmarks` strategy.
+- **Reality check.** A study of Brazilian day traders found only about 1% earned more than the minimum
+  wage, and found no evidence they improved with practice. Slow, rules-based, tested strategies with
+  small risk are how MarketPilot tries to avoid that fate.""")
     st.markdown("### Technical indicators")
     INDICATORS = {
         "Moving average (SMA / EMA)": "The average price over the last N bars. SMA weights all bars equally; EMA "
@@ -366,6 +397,12 @@ with tabs[8]:
             "is the basis of the famous Turtle trading rules.",
         "52-week high": "The highest price of the past year. Research (George & Hwang 2004) found stocks near "
             "52-week highs tend to keep outperforming.",
+        "Stochastic RSI": "RSI of the RSI, scaled 0–100 and smoothed. Both lines under 20 = deeply oversold "
+            "momentum; one of the '3 checkmarks'.",
+        "Fibonacci retracement": "After a swing, pullbacks often pause around 38.2%–61.8% of the move "
+            "(the 'golden pocket' near 61.8%). The Confluence bot checks if price is in that zone.",
+        "Market structure / swing points": "Swing highs and lows mark where buyers or sellers took control. A "
+            "break of the last swing changes the structure; stops are often placed just beyond it.",
         "Efficiency ratio / regime": "How straight the path of price has been (1 = straight line, 0 = noise). "
             "MarketPilot labels each market trending, ranging or volatile from this and ATR.",
     }
@@ -379,3 +416,46 @@ with tabs[8]:
             st.write((cls.__doc__ or "").strip())
             st.caption("Settings tested by research: " + ", ".join(f"{k} ∈ {v}" for k, v in cls.grid.items()))
     st.info("Educational information about how the bots work — not financial advice.")
+
+
+# ---------------- Markets ----------------
+with tabs[9]:
+    import json
+    st.subheader("Markets — all 66 markets the bots watch")
+    fg = store.get_control("fear_greed", "")
+    if fg:
+        try:
+            fgd = json.loads(fg)
+            c1, c2 = st.columns([1, 3])
+            c1.metric("Crypto Fear & Greed", f"{fgd['value']} / 100", fgd["label"], delta_color="off")
+            c2.caption("0 = extreme fear, 100 = extreme greed. Recorded daily as learning data, not a trade "
+                       "signal. Data: Alternative.me Crypto Fear & Greed Index (alternative.me).")
+        except Exception:
+            pass
+    mk = pd.DataFrame(store.market())
+    if mk.empty:
+        st.info("The worker fills this in on its next hourly run.")
+    else:
+        groups = ["all"] + sorted(mk["asset_class"].unique())
+        g = st.radio("Group", groups, horizontal=True, key="mkt_group")
+        view = mk if g == "all" else mk[mk["asset_class"] == g]
+        view = view.assign(trend=view["above_200d"].map({1: "up", 0: "down"}).fillna("–"))
+        view = view.sort_values("conf_long", ascending=False)
+        st.dataframe(
+            view[["symbol", "asset_class", "price", "chg_1d", "chg_5d", "chg_20d", "trend", "rsi14", "regime",
+                  "atr_pct", "conf_long", "conf_short", "bar_time"]].style.format(
+                {"price": "{:,.4f}", "chg_1d": "{:+.2%}", "chg_5d": "{:+.2%}", "chg_20d": "{:+.2%}",
+                 "rsi14": "{:.0f}", "atr_pct": "{:.2%}"}, na_rep="–"),
+            hide_index=True, width="stretch",
+            column_config={"conf_long": st.column_config.ProgressColumn("Long confluence", min_value=0,
+                                                                         max_value=8, format="%d/8"),
+                           "conf_short": st.column_config.ProgressColumn("Short confluence", min_value=0,
+                                                                          max_value=8, format="%d/8")})
+        st.caption("Confluence = how many of 8 independent factors currently agree with a long or short. "
+                   "It describes the chart; trades still need an approved strategy's signal.")
+        chg = view.dropna(subset=["chg_20d"]).sort_values("chg_20d")
+        fig = go.Figure(go.Bar(x=chg["chg_20d"], y=chg["symbol"], orientation="h",
+                               marker_color=[GOOD if v > 0 else CRITICAL for v in chg["chg_20d"]],
+                               hovertemplate="%{y}: %{x:+.1%}<extra></extra>"))
+        fig.update_xaxes(tickformat=".0%", title="20-day change")
+        st.plotly_chart(style(fig, max(300, 18 * len(chg))), width="stretch")

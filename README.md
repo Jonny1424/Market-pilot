@@ -1,9 +1,16 @@
-# MarketPilot v0.7 — Multi-Agent AI Paper Trading
+# MarketPilot v0.8 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.8:** ideas from professional trading educators and exchange apps — a
+Confluence bot that scores every signal on 8 factors and measures whether high
+scores really win more; market-structure (swing) stops tested against ATR stops;
+the Crypto Crew University "3 checkmarks" strategy; a Markets tab with all 66
+markets and the Crypto Fear & Greed index. Upgrade: run
+`supabase/migrations/20261121_marketpilot_v08.sql`.
 
 **v0.7:** Learning Lab — shadow bots practise all 9 strategies on all 66 markets to
 collect forward evidence fast; the Learning bot promotes strategies that prove
@@ -126,7 +133,7 @@ python -m marketpilot research                # real data (Yahoo Finance)
 python -m marketpilot run-once                # one trading cycle
 python -m marketpilot report                  # win rate, win/loss, expectancy, P&L
 python -m marketpilot kill   |  resume        # kill switch
-pytest                                        # 39 tests
+pytest                                        # 44 tests
 ```
 
 Add `--db supabase` (with `SUPABASE_URL`/`SUPABASE_SERVICE_KEY` in env) to use Supabase.
