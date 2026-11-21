@@ -83,8 +83,28 @@ decision:
 
 # Win-rate goal shown on the dashboard. Win rate is tracked but strategies are
 # NOT optimised on it alone (that rewards tiny targets + wide stops).
+# Goal (v0.11): small losses and positive expectancy, not a high win rate.
 goals:
-  target_win_rate: 0.70
+  target_win_rate: 0.70        # kept for reference only
+  max_drawdown_pct: 10.0       # the account should never fall more than this below its peak
+  min_expectancy_r: 0.10       # average result per trade we aim to beat
+
+# Loss Control (v0.11): size every new trade down when big or clustered losses are more likely.
+loss_control:
+  enabled: true
+  vol_high_rank: 0.80          # market's daily range in the top 20% of its past year...
+  vol_high_mult: 0.5           # ...risk half
+  vol_extreme_rank: 0.95       # top 5%...
+  vol_extreme_mult: 0.25       # ...risk a quarter
+  dd_soft_pct: 3.0             # account 3% below its peak -> half risk
+  dd_soft_mult: 0.5
+  dd_hard_pct: 6.0             # 6% below peak -> quarter risk
+  dd_hard_mult: 0.25
+  streak_losses: 4             # 4 losses in a row -> half risk until a win
+  streak_mult: 0.5
+  min_mult: 0.25               # never below a quarter of normal risk
+  max_positions_per_group: 3   # related markets lose together
+  max_open_risk_pct: 3.0       # total risk across open trades
 
 news:
   calendar_file: config/events.yaml
