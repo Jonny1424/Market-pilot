@@ -29,7 +29,7 @@ TABLES = {
         r_multiple REAL, last_bar_time TEXT, signal_bar_time TEXT, atr REAL,
         stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT, trail_atr REAL,
         exit_ma INTEGER, exit_on TEXT, best_price REAL, stop_swing INTEGER, swing_level REAL,
-        confluence INTEGER, tm_p_target REAL, tm_p_stop REAL, tm_exp_r REAL""",
+        confluence INTEGER, tm_p_target REAL, tm_p_stop REAL, tm_exp_r REAL, grade TEXT""",
     "mp_shadow_trades": None,  # filled below: same columns as mp_trades
     "mp_strategies": """
         strategy_id TEXT PRIMARY KEY, symbol TEXT, asset_class TEXT, strategy TEXT,

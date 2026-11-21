@@ -28,9 +28,12 @@ def send(title: str, message: str, tags: str = "chart_with_upwards_trend", prior
 
 def trade_opened(t: dict) -> None:
     side = "LONG" if int(t["direction"]) > 0 else "SHORT"
-    send(f"Paper trade opened: {t['symbol']} {side}",
+    g = f" [{t['grade']}]" if t.get("grade") else ""
+    odds = (f"\nOdds: target first {float(t['tm_p_target']):.0%}, stop first {float(t['tm_p_stop']):.0%}"
+            if t.get("tm_p_target") is not None and t.get("tm_p_stop") is not None else "")
+    send(f"Paper trade opened: {t['symbol']} {side}{g}",
          f"Entry {float(t['entry_price']):.4f} | stop {float(t['stop']):.4f} | target "
-         f"{'exit rule / trailing stop' if float(t.get('target_atr') or 0) >= NO_TARGET else _lvl(t['target'])}\nRisk £{float(t['risk_gbp']):.2f} | {t['strategy'].split('(')[0]}",
+         f"{'exit rule / trailing stop' if float(t.get('target_atr') or 0) >= NO_TARGET else _lvl(t['target'])}\nRisk £{float(t['risk_gbp']):.2f} | {t['strategy'].split('(')[0]}{odds}",
          tags="arrow_forward")
 
 

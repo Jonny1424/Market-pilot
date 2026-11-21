@@ -21,6 +21,7 @@ from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
 from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
 from .bots.news import NewsBot
+from .bots import conviction as cv
 from .bots import timemachine as tm
 from .bots.performance import realized_today, report, retirement_review
 from .bots.regime import classify_row
@@ -131,7 +132,8 @@ class Engine:
                 if tradable:
                     summary["shadow_opened"] += shadow_signals(self.shadow_view, self.shadow, symbol, cls, ind,
                                                                classify_row(ind.iloc[-1]), shadow_params, mf_state,
-                                                               cost=cost, tm_paths=self._shadow_tm_paths())
+                                                               cost=cost, tm_paths=self._shadow_tm_paths(),
+                                                               cv_cfg=self.s.raw.get("conviction", {}))
 
             if not tradable or symbol not in approved:
                 continue
@@ -175,15 +177,11 @@ class Engine:
                                            cls in SHORTABLE, n_paths=int(tm_cfg.get("paths", tm.N_PATHS)))
                     except Exception as exc:  # odds are information; never let them break trading
                         self.log("time_machine", f"{symbol}: simulation failed ({type(exc).__name__})", "warning")
-                    if odds is not None:
-                        min_p = float(tm_cfg.get("min_p_target", 0) or 0)
-                        min_r = tm_cfg.get("min_exp_r")
-                        if min_p and odds.p_target < min_p:
-                            reasons.append(f"time machine: target first only {odds.p_target:.0%} (min {min_p:.0%})")
-                            dec.trade = False
-                        if min_r is not None and odds.exp_r < float(min_r):
-                            reasons.append(f"time machine: average {odds.exp_r:+.2f}R below {float(min_r):+.2f}R")
-                            dec.trade = False
+                cv_cfg = self.s.raw.get("conviction", {})
+                c_grade = cv.grade(c_score, odds, cv_cfg)
+                if not cv.passes(c_grade, cv_cfg.get("min_grade")):
+                    reasons.append(f"grade {c_grade} below minimum {cv_cfg.get('min_grade')}")
+                    dec.trade = False
                 risk_res = None
                 rpu = None
                 if dec.trade:
@@ -201,7 +199,8 @@ class Engine:
                     reasons += risk_res.reasons
                 go = dec.trade and risk_res is not None and risk_res.ok
                 evidence = {**dec.evidence, "signal": sig.note, "confluence": c_score,
-                            "confluence_factors": c_hits, "time_machine": odds.to_dict() if odds else None}
+                            "confluence_factors": c_hits, "time_machine": odds.to_dict() if odds else None,
+                            "grade": c_grade}
                 if risk_res is not None:
                     evidence.update({"qty": risk_res.quantity, "risk_gbp": risk_res.risk_gbp,
                                      "notional_gbp": risk_res.notional_gbp, "cost_r": risk_res.cost_r})
@@ -217,11 +216,12 @@ class Engine:
                                        risk_gbp=risk_res.risk_gbp, risk_per_unit=rpu, fx=fx,
                                        notional=risk_res.notional_gbp, cost_r=risk_res.cost_r,
                                        swing=swing_level(row, sig.direction), confluence=c_score,
-                                       conf_text=conf.describe(c_hits), extra=tm.trade_fields(odds),
-                                       extra_note=odds.describe() if odds else "")
+                                       conf_text=conf.describe(c_hits), extra={**tm.trade_fields(odds), "grade": c_grade},
+                                       extra_note=cv.describe(c_grade, c_score, odds)
+                                       + (f" | {odds.describe()}" if odds else ""))
                     summary["new_orders"] += 1
                     self.log("trade_decision", f"ORDER {symbol} {'LONG' if sig.direction > 0 else 'SHORT'} "
-                             f"[{strat.key}] EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}")
+                             f"[{strat.key}] grade {c_grade}, EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}")
                 else:
                     summary["rejected"] += 1
 
