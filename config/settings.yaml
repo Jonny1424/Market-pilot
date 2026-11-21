@@ -104,6 +104,12 @@ learning:
   demote_min_trades: 30
   demote_below_expectancy_r: 0.0
 
+# Confluence bot (v0.8): scores every signal 0-8 on independent factors (trend,
+# momentum, key level, Fibonacci zone, volume, volatility, benchmark trend).
+# 0 = record only. Raise only once the Learning lab shows high scores really win more.
+confluence:
+  min_score: 0
+
 notifications:                   # phone push via ntfy; set the NTFY_TOPIC secret to enable
   daily_summary_hour_utc: 21
 
