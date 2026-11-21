@@ -758,3 +758,88 @@ def test_paper_broker_matches_backtest_partial_across_cycles(store):
     assert t["status"] == "open" and t["partial_price"] == pytest.approx(102.2)   # entry 100.2 + 1R
     closed = pb.process("XYZ", bars, "1d", _ZERO, idx[3], log=lambda *a, **k: None)   # cycle 2: rest stopped
     assert closed and closed[0]["r_multiple"] == pytest.approx(0.5)
+
+
+# ---------------- v0.12: storage robustness and speed ----------------
+def test_json_fields_never_store_infinity_or_nan(store):
+    import json
+    store.save_strategy({"strategy_id": "X|s", "symbol": "X", "asset_class": "stocks", "strategy": "s",
+                         "family": "f", "params": "p", "status": "rejected", "reasons": [],
+                         "oos": {"profit_factor": float("inf"), "t": float("nan"), "nested": [float("-inf"), 1.0]},
+                         "holdout": {}, "avg_cost_r": float("nan"), "researched_at": "now",
+                         "data_start": "a", "data_end": "b"})
+    raw = store._select("mp_strategies", {"strategy_id": "X|s"})[0]["oos"]
+    assert "Infinity" not in raw and "NaN" not in raw
+    assert json.loads(raw) == {"profit_factor": None, "t": None, "nested": [None, 1.0]}
+
+
+def test_cycle_read_cache_serves_repeats_and_clears_on_write(store):
+    calls = []
+    orig = store._select
+    store._select = lambda *a, **k: (calls.append(a[0]), orig(*a, **k))[1]
+    store.begin_cycle()
+    store.trades(); store.trades(); store.get_control("a"); store.get_control("b")
+    assert calls.count("mp_trades") == 1 and calls.count("mp_control") == 1
+    store.set_control("a", "1")
+    assert store.get_control("a") == "1"                     # write cleared the cache
+    store.open_trade({"trade_id": "t1", "candidate_id": "c1", "symbol": "S", "status": "open"})
+    assert len(store.trades()) == 1
+    store.end_cycle()
+    store.trades(); store.trades()
+    assert calls.count("mp_trades") == 4                     # no caching outside a cycle (the app)
+
+
+def test_supabase_select_pages_past_1000_rows():
+    from marketpilot.storage import SupabaseStore
+
+    class Q:
+        def __init__(self, data): self.data, self.r = data, None
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def order(self, *_a, **_k): return self
+        def limit(self, n): self.r = (0, n - 1); return self
+        def range(self, a, b): self.r = (a, b); return self
+        def execute(self):
+            a, b = self.r or (0, 999)
+            b = min(b, a + 999)          # server cap: 1000 rows per request
+            return type("R", (), {"data": self.data[a:b + 1]})()
+
+    rows = [{"i": i} for i in range(2500)]
+    st = SupabaseStore.__new__(SupabaseStore)
+    st.db = type("DB", (), {"table": lambda self, _t: Q(rows)})()
+    assert len(st._select("mp_shadow_trades")) == 2500
+    assert len(st._select("mp_events", limit=300)) == 300
+    assert len(st._select("mp_candidates", limit=1500)) == 1500
+
+
+def test_market_overview_is_saved_in_one_batch(small_settings, store):
+    eng = Engine(small_settings, SyntheticProvider(), store, live=False)
+    eng.cycle(datetime(2025, 6, 2, 0, 7, tzinfo=UTC))
+    assert len(store.market()) == len(eng._symbols())
+    assert any("cycle done" in e["message"] for e in store.events(50))
+
+
+def test_yfinance_batch_prefetch_and_cache(monkeypatch):
+    import sys, types
+    from marketpilot.data import YFinanceProvider
+    idx = pd.date_range("2026-01-01", periods=30, freq="D")
+    cols = pd.MultiIndex.from_product([["AAA", "BBB"], ["Open", "High", "Low", "Close", "Volume"]])
+    batch = pd.DataFrame(1.0, index=idx, columns=cols)
+    batch[("BBB", "Close")] = float("nan")                 # broken ticker -> falls back
+    single = pd.DataFrame(2.0, index=idx, columns=["Open", "High", "Low", "Close", "Volume"])
+    calls = []
+
+    def download(tickers, **kw):
+        calls.append(tickers)
+        return batch if isinstance(tickers, list) else single
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=download))
+    p = YFinanceProvider()
+    end = datetime(2026, 2, 5, tzinfo=UTC)
+    start = end - timedelta(days=40)
+    assert p.prefetch(["AAA", "BBB"], "1d", start, end) == 1
+    a = p.history("AAA", "1d", start + timedelta(days=5), end)   # served from the batch
+    assert len(calls) == 1 and (a["close"] == 1.0).all()
+    b = p.history("BBB", "1d", start, end)                       # not in batch -> own request
+    assert len(calls) == 2 and (b["close"] == 2.0).all()
+    p.history("BBB", "1d", start, end)                           # now cached
+    assert len(calls) == 2
