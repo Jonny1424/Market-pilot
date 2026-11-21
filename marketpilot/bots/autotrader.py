@@ -13,7 +13,7 @@ import uuid
 
 import pandas as pd
 
-from ..backtest import plan_levels, realized_r, step_position
+from ..backtest import MANAGEMENT, plan_levels, realized_r, step_position, trade_r
 from ..costs import CostModel
 from ..data import interval_td
 from ..strategies import Signal
@@ -27,10 +27,17 @@ def _f(x, default=0.0) -> float:
 
 
 class PaperBroker:
-    def __init__(self, store, on_open=None, on_close=None):
+    def __init__(self, store, on_open=None, on_close=None, on_partial=None):
         self.store = store
         self.on_open = on_open or (lambda t: None)
         self.on_close = on_close or (lambda t: None)
+        self.on_partial = on_partial or (lambda t, st: None)
+
+    def log_partial(self, t: dict, st: dict) -> None:
+        try:
+            self.on_partial(t, st)
+        except Exception:
+            pass
 
     def submit(self, *, candidate_id: str, symbol: str, asset_class: str, strategy_key: str,
                signal: Signal, regime: str, bar_time: pd.Timestamp, atr: float, qty: float,
@@ -102,7 +109,12 @@ class PaperBroker:
               "held": int(_f(t.get("bars_held"))), "max_hold": int(t["max_hold_bars"]),
               "trail_atr": _f(t.get("trail_atr")), "exit_ma": int(_f(t.get("exit_ma"))),
               "exit_on": t.get("exit_on") or "",
-              "best": None if t.get("best_price") is None or pd.isna(t.get("best_price")) else float(t["best_price"])}
+              "best": None if t.get("best_price") is None or pd.isna(t.get("best_price")) else float(t["best_price"]),
+              "entry": _f(t.get("entry_price")) or None, "rpu": _f(t.get("risk_per_unit")) or None,
+              "mgmt": MANAGEMENT.get(t.get("mgmt") or "base", {}),
+              "partial_price": None if t.get("partial_price") is None or pd.isna(t.get("partial_price"))
+              else float(t["partial_price"])}
+        had_partial = st["partial_price"] is not None
         for ts, bar in bars.iterrows():
             if ts < opened:
                 continue
@@ -111,19 +123,27 @@ class PaperBroker:
                 exit_px, reason = hit
                 d = st["direction"]
                 rpu, qty, fx = _f(t["risk_per_unit"]), _f(t["quantity"]), _f(t["fx_to_gbp"], 1.0)
-                r, _ = realized_r(d, _f(t["entry_price"]), exit_px, rpu, cost)
+                r = trade_r(st, d, _f(t["entry_price"]), exit_px, rpu, cost)
                 fees = (cost.commission_per_unit(_f(t["entry_price"])) + cost.commission_per_unit(exit_px)) * qty * fx \
                     + 2 * cost.commission_fixed
                 pnl = r * rpu * qty * fx - 2 * cost.commission_fixed
                 changes = {"status": "closed", "closed_at": str(ts), "exit_price": exit_px,
                            "exit_reason": reason, "r_multiple": pnl / _f(t["risk_gbp"], 1.0),
                            "pnl_gbp": pnl, "fees_gbp": fees, "bars_held": st["held"],
-                           "stop": st["stop"], "last_bar_time": str(ts)}
+                           "stop": st["stop"], "last_bar_time": str(ts), "partial_price": st["partial_price"]}
                 self.store.update_trade(t["trade_id"], changes)
                 return {**t, **changes}
-        self.store.update_trade(t["trade_id"], {"bars_held": st["held"], "stop": st["stop"],
-                                                "best_price": st["best"], "last_bar_time": str(bars.index[-1])})
+        upd = {"bars_held": st["held"], "stop": st["stop"], "best_price": st["best"],
+               "last_bar_time": str(bars.index[-1])}
+        if st["partial_price"] is not None and not had_partial:
+            upd["partial_price"] = st["partial_price"]
+            self.log_partial(t, st)
+        self.store.update_trade(t["trade_id"], upd)
         return None
+
+
+def _noop(*_a, **_k):
+    return None
 
 
 def mark_to_market(t: dict, price: float) -> float:

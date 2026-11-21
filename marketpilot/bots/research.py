@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from ..backtest import confluence_breakdown, market_filter_series, passes_gate, walk_forward
+from ..backtest import (confluence_breakdown, management_breakdown, market_filter_series, passes_gate,
+                        walk_forward)
 from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
@@ -35,6 +36,9 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
     filters = settings.raw.get("market_filter") or {}
     learn_cfg = settings.raw.get("learning")
     lc_cfg = lc_config(settings.raw)
+    tm_cfg = settings.raw.get("trade_management") or {}
+    mgmt = tm_cfg.get("mode", "base")
+    compare_modes = tuple(tm_cfg.get("compare", ["base", "breakeven", "partial"]))
     fstats = forward_stats(store) if learn_cfg else None
     rows_out = []
     for cls_name, spec in settings["universe"].items():
@@ -72,7 +76,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                     mk = market_filter_series(filt_df, df.index)
                 r = walk_forward(df, strat, cost, cls_name in SHORTABLE,
                                  folds=gate["walk_forward_folds"], holdout_fraction=gate["holdout_fraction"],
-                                 market_ok=mk)
+                                 market_ok=mk, mgmt=mgmt, compare_modes=compare_modes)
                 per_symbol[symbol] = r
                 oos_r += [t.r_multiple for t in r["oos_trades"]]
                 oos_all += r["oos_trades"]
@@ -81,6 +85,8 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
             pooled = {"oos": summarize(oos_r), "holdout": summarize(hold_r)}
             by_conf = confluence_breakdown(oos_all)
             lc = lc_compare(sorted(oos_all, key=lambda t: t.entry_time), lc_cfg)
+            hold_all = [t for r in per_symbol.values() for t in r["holdout_trades"]]
+            mg = management_breakdown(sorted(oos_all, key=lambda t: t.entry_time), hold_all, compare_modes)
             ok, reasons = passes_gate(pooled, gate)
             if learn_cfg:  # forward (shadow) evidence can promote or demote
                 verdict, why = forward_verdict(fstats, cls_name, strat.name, learn_cfg)
@@ -98,6 +104,10 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                     f"{lc['flat']['max_drawdown_r']:.1f}R -> {lc['scaled']['max_drawdown_r']:.1f}R "
                     f"({lc['dd_cut_pct']:.0%} smaller), total {lc['flat']['total_r']:+.1f}R -> "
                     f"{lc['scaled']['total_r']:+.1f}R, {lc['share_reduced']:.0%} of trades sized down")
+            if mg:
+                log(f"research: {cls_name:<7} {strat.name:<20} management: " + " | ".join(
+                    f"{m} exp {v['expectancy_r']:+.3f}R full-loss {v['full_loss_rate']:.0%} "
+                    f"DD {v['max_drawdown_r']:.1f}R" for m, v in mg.items()))
             for symbol, r in per_symbol.items():
                 sid = f"{symbol}|{strat.name}"
                 if sid in retired:
@@ -107,7 +117,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                        "status": "approved" if ok else "rejected", "reasons": reasons,
                        "oos": {**pooled["oos"], "symbol_trades": r["oos"]["trades"],
                                "symbol_expectancy_r": r["oos"]["expectancy_r"], "by_confluence": by_conf,
-                               "loss_control": lc},
+                               "loss_control": lc, "management": mg, "mgmt_mode": mgmt},
                        "holdout": pooled["holdout"],
                        "avg_cost_r": float(sum(costs) / len(costs)) if costs else 0.0,
                        "researched_at": now_iso(), "data_start": r["data_start"], "data_end": r["data_end"]}
