@@ -119,13 +119,21 @@ safety:
   max_daily_trades: 20
 
 # Time Machine: Monte Carlo odds for every trade before it is taken (v0.9).
-# Records only until the Learning Lab shows the odds are reliable (calibration).
 time_machine:
   enabled: true
   paths: 10000          # replays per real candidate
   shadow_paths: 2000    # replays per practice (shadow) trade
-  min_p_target: 0       # e.g. 0.35 = skip trades whose target-first odds are below 35%
-  min_exp_r: null       # e.g. 0.0 = skip trades whose simulated average R is negative
+
+# Conviction grade (v0.10): confluence first, Time Machine as the final check.
+# The Time Machine only votes when 6, 7 or 8 of the 8 confluence factors agree.
+#   A+ = confluence 6-8 and the Time Machine confirms   A = 6-8, not confirmed
+#   B  = confluence 4-5                                 C = 0-3
+conviction:
+  high_confluence: 6
+  medium_confluence: 4
+  confirm_min_exp_r: 0.0     # Time Machine confirms when simulated average R is above this...
+  confirm_min_p_target: 0.0  # ...and target-first odds are at least this
+  min_grade: null            # e.g. "A+" = only take A+ trades. Record-only until the Learning lab proves it.
 
 # Headlines for open positions and benchmarks, shown on the dashboard (context only).
 headlines:
