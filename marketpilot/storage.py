@@ -29,7 +29,7 @@ TABLES = {
         r_multiple REAL, last_bar_time TEXT, signal_bar_time TEXT, atr REAL,
         stop_atr REAL, target_atr REAL, cost_r REAL, note TEXT, trail_atr REAL,
         exit_ma INTEGER, exit_on TEXT, best_price REAL, stop_swing INTEGER, swing_level REAL,
-        confluence INTEGER""",
+        confluence INTEGER, tm_p_target REAL, tm_p_stop REAL, tm_exp_r REAL""",
     "mp_shadow_trades": None,  # filled below: same columns as mp_trades
     "mp_strategies": """
         strategy_id TEXT PRIMARY KEY, symbol TEXT, asset_class TEXT, strategy TEXT,
@@ -152,6 +152,11 @@ class SQLiteStore(BaseStore):
         self.conn.row_factory = sqlite3.Row
         for name, cols in TABLES.items():
             self.conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({cols})")
+            have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({name})")}
+            for col in cols.split(","):            # older local files: add new columns
+                parts = col.split()
+                if len(parts) >= 2 and parts[0] not in have and "AUTOINCREMENT" not in col:
+                    self.conn.execute(f"ALTER TABLE {name} ADD COLUMN {parts[0]} {parts[1]}")
         self.conn.commit()
 
     def _insert(self, table, row, ignore_conflict=False):

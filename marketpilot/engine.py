@@ -21,6 +21,7 @@ from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
 from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
 from .bots.news import NewsBot
+from .bots import timemachine as tm
 from .bots.performance import realized_today, report, retirement_review
 from .bots.regime import classify_row
 from .bots.risk import RiskManager
@@ -129,7 +130,8 @@ class Engine:
                                                                     lambda *a, **k: None))
                 if tradable:
                     summary["shadow_opened"] += shadow_signals(self.shadow_view, self.shadow, symbol, cls, ind,
-                                                               classify_row(ind.iloc[-1]), shadow_params, mf_state)
+                                                               classify_row(ind.iloc[-1]), shadow_params, mf_state,
+                                                               cost=cost, tm_paths=self._shadow_tm_paths())
 
             if not tradable or symbol not in approved:
                 continue
@@ -165,6 +167,23 @@ class Engine:
                 if min_conf and c_score < min_conf:
                     reasons.append(f"confluence {c_score}/{conf.MAX_SCORE} below minimum {min_conf}")
                     dec.trade = False
+                odds = None
+                tm_cfg = self.s.raw.get("time_machine", {})
+                if tm_cfg.get("enabled", True):
+                    try:
+                        odds = tm.odds_for(ind, sig, cost, swing_level(row, sig.direction), strat,
+                                           cls in SHORTABLE, n_paths=int(tm_cfg.get("paths", tm.N_PATHS)))
+                    except Exception as exc:  # odds are information; never let them break trading
+                        self.log("time_machine", f"{symbol}: simulation failed ({type(exc).__name__})", "warning")
+                    if odds is not None:
+                        min_p = float(tm_cfg.get("min_p_target", 0) or 0)
+                        min_r = tm_cfg.get("min_exp_r")
+                        if min_p and odds.p_target < min_p:
+                            reasons.append(f"time machine: target first only {odds.p_target:.0%} (min {min_p:.0%})")
+                            dec.trade = False
+                        if min_r is not None and odds.exp_r < float(min_r):
+                            reasons.append(f"time machine: average {odds.exp_r:+.2f}R below {float(min_r):+.2f}R")
+                            dec.trade = False
                 risk_res = None
                 rpu = None
                 if dec.trade:
@@ -182,7 +201,7 @@ class Engine:
                     reasons += risk_res.reasons
                 go = dec.trade and risk_res is not None and risk_res.ok
                 evidence = {**dec.evidence, "signal": sig.note, "confluence": c_score,
-                            "confluence_factors": c_hits}
+                            "confluence_factors": c_hits, "time_machine": odds.to_dict() if odds else None}
                 if risk_res is not None:
                     evidence.update({"qty": risk_res.quantity, "risk_gbp": risk_res.risk_gbp,
                                      "notional_gbp": risk_res.notional_gbp, "cost_r": risk_res.cost_r})
@@ -198,7 +217,8 @@ class Engine:
                                        risk_gbp=risk_res.risk_gbp, risk_per_unit=rpu, fx=fx,
                                        notional=risk_res.notional_gbp, cost_r=risk_res.cost_r,
                                        swing=swing_level(row, sig.direction), confluence=c_score,
-                                       conf_text=conf.describe(c_hits))
+                                       conf_text=conf.describe(c_hits), extra=tm.trade_fields(odds),
+                                       extra_note=odds.describe() if odds else "")
                     summary["new_orders"] += 1
                     self.log("trade_decision", f"ORDER {symbol} {'LONG' if sig.direction > 0 else 'SHORT'} "
                              f"[{strat.key}] EV {dec.expected_r:+.3f}R, risk £{risk_res.risk_gbp:.2f}")
@@ -207,6 +227,7 @@ class Engine:
 
         if self.live:
             self._fear_greed()
+            self._headlines()
         self.safety.end_of_cycle(summary["failed_feeds"], len(symbols), self._ts)
         trades = self.store.trades()
         eq, realized = self.equity(trades, last_prices)
@@ -257,6 +278,37 @@ class Engine:
             r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10).json()["data"][0]
             self.store.set_control("fear_greed", json.dumps(
                 {"value": int(r["value"]), "label": r["value_classification"], "ts": self._ts}))
+        except Exception:
+            pass
+
+    def _shadow_tm_paths(self) -> int:
+        tm_cfg = self.s.raw.get("time_machine", {})
+        return int(tm_cfg.get("shadow_paths", 2000)) if tm_cfg.get("enabled", True) else 0
+
+    def _headlines(self) -> None:
+        """Latest headlines for open positions and the benchmark markets (Yahoo Finance).
+        Shown on the dashboard as context; the news veto lives in the News bot."""
+        try:
+            import json
+
+            import yfinance as yf
+            cfg = self.s.raw.get("headlines", {})
+            symbols = [t["symbol"] for t in self.store.trades() if t["status"] in ("open", "pending")]
+            symbols += cfg.get("always", ["SPY", "BTC-USD", "EURUSD=X", "GLD"])
+            out = []
+            for sym in list(dict.fromkeys(symbols))[: int(cfg.get("max_symbols", 12))]:
+                for item in (yf.Ticker(sym).news or [])[: int(cfg.get("per_symbol", 3))]:
+                    c = item.get("content") or item
+                    title = c.get("title")
+                    if not title:
+                        continue
+                    url = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+                           or c.get("link") or "")
+                    out.append({"symbol": sym, "title": title, "url": url,
+                                "publisher": (c.get("provider") or {}).get("displayName") or c.get("publisher", ""),
+                                "published": c.get("pubDate") or c.get("providerPublishTime") or ""})
+            if out:
+                self.store.set_control("headlines", json.dumps({"ts": self._ts, "items": out}, default=str))
         except Exception:
             pass
 
