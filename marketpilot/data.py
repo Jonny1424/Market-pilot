@@ -70,21 +70,63 @@ class YFinanceProvider(DataProvider):
     paper trading, not a substitute for a broker's bid/ask feed."""
     name = "yfinance"
 
-    def history(self, symbol, interval, start, end):
-        import yfinance as yf
-        # Yahoo caps intraday history at ~730 days.
-        if interval != "1d":
-            start = max(start, end - timedelta(days=729))
-        df = yf.download(symbol, start=start, end=end, interval=interval,
-                         auto_adjust=True, progress=False, threads=False)
-        if df is None or df.empty:
-            raise RuntimeError(f"no data returned for {symbol}")
+    def __init__(self):
+        # (symbol, interval) -> (start, end, frame). Lives for one worker run, so the
+        # same market is never downloaded twice (e.g. SPY as a market AND as the filter).
+        self._cache: dict[tuple[str, str], tuple] = {}
+
+    @staticmethod
+    def _clean(df: pd.DataFrame, interval: str, end) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
         idx = pd.DatetimeIndex(df.index)
         df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
         return drop_incomplete(df.dropna(), interval, end)
+
+    def prefetch(self, symbols, interval, start, end) -> int:
+        """Download many markets in ONE batched request (much faster than one by one).
+        Anything missing or malformed simply falls back to a normal per-symbol fetch."""
+        import yfinance as yf
+        symbols = [s for s in dict.fromkeys(symbols) if (s, interval) not in self._cache]
+        if len(symbols) < 2:
+            return 0
+        if interval != "1d":
+            start = max(start, end - timedelta(days=729))
+        try:
+            raw = yf.download(symbols, start=start, end=end, interval=interval, auto_adjust=True,
+                              progress=False, threads=True, group_by="ticker")
+        except Exception:
+            return 0
+        if raw is None or raw.empty or not isinstance(raw.columns, pd.MultiIndex):
+            return 0
+        got = 0
+        for sym in symbols:
+            try:
+                df = self._clean(raw[sym].copy(), interval, end)
+            except Exception:
+                continue
+            if len(df) > 0:
+                self._cache[(sym, interval)] = (start, end, df)
+                got += 1
+        return got
+
+    def history(self, symbol, interval, start, end):
+        import yfinance as yf
+        # Yahoo caps intraday history at ~730 days.
+        if interval != "1d":
+            start = max(start, end - timedelta(days=729))
+        hit = self._cache.get((symbol, interval))
+        if hit and hit[0] <= start + timedelta(days=3) and abs((hit[1] - end).total_seconds()) < 6 * 3600:
+            df = hit[2]
+            return df[df.index >= pd.Timestamp(start).tz_convert("UTC")].copy()
+        df = yf.download(symbol, start=start, end=end, interval=interval,
+                         auto_adjust=True, progress=False, threads=False)
+        if df is None or df.empty:
+            raise RuntimeError(f"no data returned for {symbol}")
+        df = self._clean(df, interval, end)
+        self._cache[(symbol, interval)] = (start, end, df)
+        return df
 
 
 class CCXTProvider(DataProvider):

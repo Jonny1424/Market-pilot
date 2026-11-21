@@ -82,6 +82,27 @@ class Engine:
                      if t["status"] == "open" and t["symbol"] in last_prices)
         return self.s.account["starting_balance"] + realized + unreal, realized
 
+    def _lookback(self, cls: str, interval: str):
+        step = interval_td(interval)
+        return step * HISTORY_BARS * (1.6 if interval == "1d" and cls != "crypto" else 1.0)
+
+    def _prefetch(self, symbols, now) -> None:
+        """One batched download per (interval, lookback) group instead of one request per market."""
+        if not hasattr(self.provider, "prefetch"):
+            return
+        groups: dict = {}
+        for symbol, cls, _ in symbols:
+            interval = self.s["universe"][cls]["interval"]
+            groups.setdefault((interval, self._lookback(cls, interval)), []).append(symbol)
+        for (interval, lookback), syms in groups.items():
+            if interval == "1d":   # the market filters' benchmarks ride along with the daily batch
+                syms = syms + [f["symbol"] for f in (self.s.raw.get("market_filter") or {}).values()
+                               if isinstance(f, dict) and f.get("symbol")]
+            try:
+                self.provider.prefetch(syms, interval, now - lookback, now)
+            except Exception:
+                pass
+
     def _symbols(self) -> list[tuple[str, str, bool]]:
         """(symbol, asset_class, tradable). Non-tradable = only managing an old position."""
         out = [(s, self.s.asset_class_of(s), True) for s in self.s.all_symbols()]
@@ -93,9 +114,21 @@ class Engine:
         return out
 
     def cycle(self, now: datetime) -> dict:
+        begin = getattr(self.store, "begin_cycle", None)
+        if begin:
+            begin()
+        try:
+            return self._cycle(now)
+        finally:
+            end = getattr(self.store, "end_cycle", None)
+            if end:
+                end()
+
+    def _cycle(self, now: datetime) -> dict:
         now_ts = pd.Timestamp(now)
         self._ts = now_ts.isoformat()
         self._eq_hist = None
+        self._market_rows = []
         summary = {"new_orders": 0, "closed": 0, "candidates": 0, "rejected": 0, "failed_feeds": 0,
                    "shadow_opened": 0, "shadow_closed": 0}
         if self.learning_on:
@@ -106,6 +139,7 @@ class Engine:
             approved.setdefault(a["symbol"], []).append(a)
         last_prices: dict[str, float] = {}
         symbols = self._symbols()
+        self._prefetch(symbols, now)
         fx_cache: dict[str, float] = {}
         filters = market_filter_status(self.s, self.provider, now)
         was_killed = self.safety.kill_switch_on()
@@ -114,7 +148,7 @@ class Engine:
             interval = self.s["universe"][cls]["interval"]
             cost = cost_model_for(self.s, cls)
             step = interval_td(interval)
-            lookback = step * HISTORY_BARS * (1.6 if interval == "1d" and cls != "crypto" else 1.0)
+            lookback = self._lookback(cls, interval)
             try:
                 df = self.provider.history(symbol, interval, now - lookback, now)
                 if df.empty:
@@ -246,6 +280,10 @@ class Engine:
                 else:
                     summary["rejected"] += 1
 
+        try:
+            self.store.save_market_many(self._market_rows)
+        except Exception as exc:
+            self.log("monitoring", f"market overview save failed ({type(exc).__name__})", "warning")
         self._save_risk_state(last_prices)
         if self.live:
             self._fear_greed()
@@ -269,6 +307,9 @@ class Engine:
             notify.kill_switch(self.store.get_control("pause_reason", "") or "safety rule triggered")
         self._daily_summary(now_ts, trades, eq, n_open)
         summary["equity"] = eq
+        self.log("worker", f"cycle done: {len(symbols)} markets, {summary['candidates']} signals, "
+                 f"{summary['new_orders']} orders, {summary['closed']} closed, "
+                 f"{summary['failed_feeds']} feed failures, equity £{eq:,.2f}")
         return summary
 
     def _snapshot(self, symbol: str, cls: str, ind, market_ok) -> None:
@@ -281,7 +322,7 @@ class Engine:
                 return float(c.iloc[-1] / c.iloc[-1 - n] - 1) if len(c) > n else None
             cl, _ = conf.score(row, 1, market_ok)
             cs, _ = conf.score(row, -1, market_ok)
-            self.store.save_market({
+            self._market_rows.append({
                 "symbol": symbol, "asset_class": cls, "ts": self._ts, "bar_time": str(ind.index[-1]),
                 "price": float(row["close"]), "chg_1d": chg(1), "chg_5d": chg(5), "chg_20d": chg(20),
                 "above_200d": None if pd.isna(row["sma200"]) else int(row["close"] > row["sma200"]),

@@ -10,6 +10,7 @@ Every candidate trade, rejection reason, fill, approval and equity snapshot is s
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -55,8 +56,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _finite(v):
+    """Replace inf/NaN (not valid JSON) with None, recursively."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_finite(x) for x in v]
+    return v
+
+
 def _enc(row: dict) -> dict:
-    return {k: (json.dumps(v, default=str) if k in JSON_FIELDS and not isinstance(v, str) else v)
+    return {k: (json.dumps(_finite(v), default=str, allow_nan=False) if k in JSON_FIELDS and not isinstance(v, str)
+                else (_finite(v) if isinstance(v, float) else v))
             for k, v in row.items()}
 
 
@@ -78,6 +91,34 @@ class BaseStore:
     def _select(self, table: str, where: dict | None = None, order: str | None = None,
                 desc: bool = False, limit: int | None = None) -> list[dict]: ...
     def _update(self, table: str, key: str, value: Any, changes: dict) -> None: ...
+    def _delete_before(self, table: str, column: str, cutoff: str) -> None: ...
+
+    # --- per-cycle read cache (worker only) ---
+    # The engine reads the same tables many times per cycle (once per market). With a
+    # remote database every read is a network round-trip, so during a cycle reads are
+    # served from memory and any write to a table clears that table's cache.
+    _CACHED = {"mp_trades", "mp_control", "mp_strategies"}
+
+    def begin_cycle(self) -> None:
+        self._cache: dict | None = {}
+
+    def end_cycle(self) -> None:
+        self._cache = None
+
+    def _read(self, table, where=None, order=None, desc=False, limit=None) -> list[dict]:
+        cache = getattr(self, "_cache", None)
+        if cache is None or table not in self._CACHED:
+            return self._select(table, where, order, desc, limit)
+        key = (table, tuple(sorted((where or {}).items())), order, desc, limit)
+        if key not in cache:
+            cache[key] = self._select(table, where, order, desc, limit)
+        return [dict(r) for r in cache[key]]
+
+    def _dirty(self, table: str) -> None:
+        cache = getattr(self, "_cache", None)
+        if cache:
+            for k in [k for k in cache if k[0] == table]:
+                del cache[k]
 
     # --- domain API ---
     def record_candidate(self, row: dict) -> bool:
@@ -91,14 +132,16 @@ class BaseStore:
         return [_dec(r) for r in self._select("mp_candidates", order="created_at", desc=True, limit=limit)]
 
     def open_trade(self, row: dict) -> bool:
+        self._dirty("mp_trades")
         return self._insert("mp_trades", _enc({"status": "open", "bars_held": 0, **row}), ignore_conflict=True)
 
     def update_trade(self, trade_id: str, changes: dict) -> None:
+        self._dirty("mp_trades")
         self._update("mp_trades", "trade_id", trade_id, _enc(changes))
 
     def trades(self, status: str | None = None) -> list[dict]:
         where = {"status": status} if status else None
-        return self._select("mp_trades", where, order="opened_at", desc=True)
+        return self._read("mp_trades", where, order="opened_at", desc=True)
 
     # --- Learning Lab shadow ledger (practice trades, never on the real paper account) ---
     def open_shadow(self, row: dict) -> bool:
@@ -115,15 +158,20 @@ class BaseStore:
     def save_market(self, row: dict) -> None:
         self._upsert("mp_market", row, "symbol")
 
+    def save_market_many(self, rows: list[dict]) -> None:
+        for r in rows:
+            self._upsert("mp_market", r, "symbol")
+
     def market(self) -> list[dict]:
         return self._select("mp_market")
 
     def save_strategy(self, row: dict) -> None:
+        self._dirty("mp_strategies")
         self._upsert("mp_strategies", _enc(row), "strategy_id")
 
     def strategies(self, status: str | None = None) -> list[dict]:
         where = {"status": status} if status else None
-        return [_dec(r) for r in self._select("mp_strategies", where)]
+        return [_dec(r) for r in self._read("mp_strategies", where)]
 
     def snapshot_equity(self, ts: str, equity: float, realized: float, open_positions: int) -> None:
         self._upsert("mp_equity", {"ts": ts, "equity_gbp": equity, "realized_gbp": realized,
@@ -139,11 +187,25 @@ class BaseStore:
         return self._select("mp_events", order="ts", desc=True, limit=limit)
 
     def get_control(self, key: str, default: str | None = None) -> str | None:
+        if getattr(self, "_cache", None) is not None:   # in a cycle: load the small control table once
+            for r in self._read("mp_control"):
+                if r["key"] == key:
+                    return r["value"]
+            return default
         rows = self._select("mp_control", {"key": key})
         return rows[0]["value"] if rows else default
 
     def set_control(self, key: str, value: str) -> None:
+        self._dirty("mp_control")
         self._upsert("mp_control", {"key": key, "value": value, "updated_at": now_iso()}, "key")
+
+    def prune(self, days: int = 60) -> None:
+        """Delete old log lines and candidate records so the free database never fills up.
+        Trades, practice trades, strategies and equity history are kept forever."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        self._delete_before("mp_events", "ts", cutoff)
+        self._delete_before("mp_candidates", "created_at", cutoff)
 
 
 class SQLiteStore(BaseStore):
@@ -191,6 +253,10 @@ class SQLiteStore(BaseStore):
         self.conn.execute(f"UPDATE {table} SET {sets} WHERE {key}=?", [*changes.values(), value])
         self.conn.commit()
 
+    def _delete_before(self, table, column, cutoff):
+        self.conn.execute(f"DELETE FROM {table} WHERE {column} < ?", [cutoff])
+        self.conn.commit()
+
 
 class SupabaseStore(BaseStore):
     def __init__(self, url: str, key: str):
@@ -217,18 +283,41 @@ class SupabaseStore(BaseStore):
     def _upsert(self, table, row, key):
         self.db.table(table).upsert(row, on_conflict=key).execute()
 
+    PAGE = 1000   # Supabase/PostgREST returns at most 1000 rows per request
+    _PK = {"mp_strategies": "strategy_id", "mp_trades": "trade_id", "mp_shadow_trades": "trade_id",
+           "mp_candidates": "candidate_id", "mp_market": "symbol", "mp_control": "key", "mp_events": "id",
+           "mp_equity": "ts"}
+
     def _select(self, table, where=None, order=None, desc=False, limit=None):
-        q = self.db.table(table).select("*")
-        for k, v in (where or {}).items():
-            q = q.eq(k, v)
-        if order:
-            q = q.order(order, desc=desc)
-        if limit:
-            q = q.limit(limit)
-        return q.execute().data or []
+        def query():
+            q = self.db.table(table).select("*")
+            for k, v in (where or {}).items():
+                q = q.eq(k, v)
+            if order:
+                q = q.order(order, desc=desc)
+            if self._PK.get(table) and self._PK[table] != order:
+                q = q.order(self._PK[table])   # stable order so pages never skip or repeat rows
+            return q
+        if limit and limit <= self.PAGE:
+            return query().limit(limit).execute().data or []
+        rows, start = [], 0
+        while True:   # page through: without this, tables over 1000 rows were silently cut off
+            end = start + self.PAGE - 1 if not limit else min(start + self.PAGE, limit) - 1
+            batch = query().range(start, end).execute().data or []
+            rows += batch
+            if len(batch) < end - start + 1 or (limit and len(rows) >= limit):
+                return rows
+            start += self.PAGE
 
     def _update(self, table, key, value, changes):
         self.db.table(table).update(changes).eq(key, value).execute()
+
+    def save_market_many(self, rows: list[dict]) -> None:
+        if rows:   # one request instead of one per market; NaN is not valid JSON, so it becomes null
+            self.db.table("mp_market").upsert([_finite(r) for r in rows], on_conflict="symbol").execute()
+
+    def _delete_before(self, table, column, cutoff):
+        self.db.table(table).delete().lt(column, cutoff).execute()
 
 
 def make_store(database: str | None = None) -> BaseStore:
