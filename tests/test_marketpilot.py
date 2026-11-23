@@ -932,3 +932,16 @@ def test_published_strategies_signal_on_their_rules():
     prev = {"close": 104.0, "kc_up": 105.0, "kc_dn": 95.0}
     row = {"close": 106.0, "kc_up": 105.5, "kc_dn": 95.5, "atr14": 1.0}
     assert KeltnerBreakout().signal(prev, row).direction == 1
+
+
+def test_late_signals_are_refused():
+    from marketpilot.data import signal_is_late
+    fri = pd.Timestamp("2026-11-20", tz="UTC")
+    # Friday's US bar: fine on Friday night or the weekend, late once Monday's 9:30 New York open has passed
+    assert not signal_is_late(fri, "1d", "SPY", datetime(2026, 11, 20, 22, 7, tzinfo=UTC))
+    assert not signal_is_late(fri, "1d", "SPY", datetime(2026, 11, 23, 14, 0, tzinfo=UTC))
+    assert signal_is_late(fri, "1d", "SPY", datetime(2026, 11, 23, 19, 14, tzinfo=UTC))
+    # 24-hour markets: fresh for a few hours after midnight UTC only
+    sun = pd.Timestamp("2026-11-22", tz="UTC")
+    assert not signal_is_late(sun, "1d", "BTC-USD", datetime(2026, 11, 23, 1, 7, tzinfo=UTC))
+    assert signal_is_late(sun, "1d", "BTC-USD", datetime(2026, 11, 23, 18, 48, tzinfo=UTC))
