@@ -1,9 +1,33 @@
-# MarketPilot v0.12 — Multi-Agent AI Paper Trading
+# MarketPilot v0.13 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.13 — same-evening decisions, live stop checks, the short side and more published strategies:**
+- **Market-close timing.** A daily bar now counts as finished at its market's close: 16:15 New York for
+  US-listed ETFs, 16:45 London for London ETFs. Crypto and forex still finish at midnight UTC. Trades are
+  decided the same evening, not the next day.
+- **Intraday watch** (`intraday_watch`). Every hourly run checks open paper and practice trades against
+  today's 15-minute prices:
+  - Stop and target hits are booked within the hour, stop checked first as in the backtest.
+  - Pending orders fill at the session's real open.
+  - Trailing stops, breakeven moves and close-based exits still happen once a day at the close, exactly
+    as tested.
+- **Breakeven management is on** (`trade_management.mode: breakeven`).
+- **Short side** (`shorting`).
+  - Every strategy except the CCU bottom signal gets a separate short-only version (`<name>_short`).
+  - Short versions are researched for stocks, international, bonds and commodities and must pass the same
+    approval gate on their own.
+  - Shorts are only allowed while the group's benchmark is below its 200-day average.
+  - Each short pays a daily holding cost (`short_carry_bps_day`).
+  - Crypto is excluded because UK retail clients can't use crypto derivatives.
+- **Three published strategies.** Each must pass the gate before it trades:
+  - 50/200-day golden cross
+  - Toby Crabel's NR7 breakout
+  - Keltner channel breakout (20-day EMA ± 2 ATR)
+- No database migration needed. The research workflow's time limit is now 90 minutes.
 
 **v0.12.1 — reliability and speed:** database reads now page past Supabase's 1,000-row cap (the
 strategy table was at 692 rows and practice trades would have been cut off silently); the worker caches
