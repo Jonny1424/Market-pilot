@@ -18,7 +18,7 @@ from ..backtest import (confluence_breakdown, management_breakdown, market_filte
 from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
-from ..strategies import ALL_STRATEGIES, SHORTABLE
+from ..strategies import allows_short, strategies_for
 from .learning import forward_stats, forward_verdict
 from .losscontrol import compare as lc_compare
 from .losscontrol import config as lc_config
@@ -68,13 +68,13 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                                                now - timedelta(days=spec["lookback_days"]), now)
                 except Exception:
                     filt_df = None
-        for strat in ALL_STRATEGIES:
+        for strat in strategies_for(cls_name, settings):
             per_symbol, oos_r, hold_r, costs, oos_all = {}, [], [], [], []
             for symbol, df in data.items():
                 mk = None
                 if filt_spec and symbol not in set(filt_spec.get("exclude", [])):
                     mk = market_filter_series(filt_df, df.index)
-                r = walk_forward(df, strat, cost, cls_name in SHORTABLE,
+                r = walk_forward(df, strat, cost, allows_short(cls_name, strat, settings),
                                  folds=gate["walk_forward_folds"], holdout_fraction=gate["holdout_fraction"],
                                  market_ok=mk, mgmt=mgmt, compare_modes=compare_modes)
                 per_symbol[symbol] = r

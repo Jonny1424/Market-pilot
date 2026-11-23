@@ -19,7 +19,7 @@ from __future__ import annotations
 import pandas as pd
 
 from ..metrics import summarize
-from ..strategies import ALL_STRATEGIES, SHORTABLE
+from ..strategies import ALL_STRATEGIES, allows_short
 
 
 class ShadowView:
@@ -60,7 +60,8 @@ def researched_params(store) -> dict[str, str]:
 
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
                    regime: str, params: dict[str, str], market_ok: bool | None = None,
-                   cost=None, tm_paths: int = 0, cv_cfg: dict | None = None, mgmt: str = "base") -> int:
+                   cost=None, tm_paths: int = 0, cv_cfg: dict | None = None, mgmt: str = "base",
+                   settings=None) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
     from ..backtest import swing_level
@@ -79,7 +80,7 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
         if (symbol, strat.name) in open_keys:
             continue
         sig = strat.signal(prev, row)
-        if sig is None or (sig.direction == -1 and cls not in SHORTABLE) or pd.isna(row["atr14"]):
+        if sig is None or (sig.direction == -1 and not allows_short(cls, strat, settings)) or pd.isna(row["atr14"]):
             continue
         odds = None
         if tm_paths and cost is not None:

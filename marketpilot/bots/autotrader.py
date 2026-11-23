@@ -13,7 +13,7 @@ import uuid
 
 import pandas as pd
 
-from ..backtest import MANAGEMENT, plan_levels, step_position, trade_r
+from ..backtest import MANAGEMENT, _entry_bar_exit, check_exit, plan_levels, step_position, trade_r
 from ..costs import CostModel
 from ..data import interval_td
 from ..strategies import Signal
@@ -58,6 +58,85 @@ class PaperBroker:
             "stop_swing": int(signal.stop_swing), "swing_level": swing, "confluence": confluence,
             "last_bar_time": str(bar_time), **(extra or {})})
 
+    def _fill(self, t: dict, open_px: float, fill_bar_time, cost: CostModel, log, how: str = "") -> None:
+        """Fill a pending order at the session's opening price (same rule as the backtest)."""
+        symbol, d = t["symbol"], int(t["direction"])
+        entry = cost.market_fill(open_px, d)
+        sig = Signal(d, _f(t["stop_atr"]), _f(t["target_atr"]), int(t["max_hold_bars"]),
+                     stop_swing=bool(_f(t.get("stop_swing"))))
+        sw = t.get("swing_level")
+        sw = None if sw is None or pd.isna(sw) else float(sw)
+        stop, target, rpu = plan_levels(entry, _f(t["atr"]), sig, cost, sw)
+        qty = _f(t["risk_gbp"]) / (rpu * _f(t["fx_to_gbp"], 1.0))  # keep £ risk at plan
+        t.update({"status": "open", "entry_price": entry, "stop": stop, "target": target,
+                  "risk_per_unit": rpu, "quantity": qty, "opened_at": str(fill_bar_time),
+                  "notional_gbp": qty * entry * _f(t["fx_to_gbp"], 1.0), "bars_held": 0,
+                  "best_price": None})
+        self.store.update_trade(t["trade_id"], {k: t[k] for k in (
+            "status", "entry_price", "stop", "target", "risk_per_unit", "quantity",
+            "opened_at", "notional_gbp")})
+        log("auto_trader", f"FILLED {symbol} {'LONG' if d > 0 else 'SHORT'} {qty:.4f} @ {entry:.5f} "
+            f"stop {stop:.5f} [{t['strategy']}]{how}")
+        self.on_open(t)
+
+    def _state(self, t: dict) -> dict:
+        return {"direction": int(t["direction"]), "stop": _f(t["stop"]), "target": _f(t["target"]),
+                "held": int(_f(t.get("bars_held"))), "entry": _f(t.get("entry_price")) or None,
+                "rpu": _f(t.get("risk_per_unit")) or None,
+                "mgmt": MANAGEMENT.get(t.get("mgmt") or "base", {}),
+                "partial_price": None if t.get("partial_price") is None or pd.isna(t.get("partial_price"))
+                else float(t["partial_price"])}
+
+    def _close(self, t: dict, st: dict, exit_px: float, reason: str, when, cost: CostModel) -> dict:
+        d = int(t["direction"])
+        rpu, qty, fx = _f(t["risk_per_unit"]), _f(t["quantity"]), _f(t["fx_to_gbp"], 1.0)
+        r = trade_r(st, d, _f(t["entry_price"]), exit_px, rpu, cost)
+        fees = (cost.commission_per_unit(_f(t["entry_price"])) + cost.commission_per_unit(exit_px)) * qty * fx \
+            + 2 * cost.commission_fixed
+        pnl = r * rpu * qty * fx - 2 * cost.commission_fixed
+        changes = {"status": "closed", "closed_at": str(when), "exit_price": exit_px,
+                   "exit_reason": reason, "r_multiple": pnl / _f(t["risk_gbp"], 1.0),
+                   "pnl_gbp": pnl, "fees_gbp": fees, "bars_held": st["held"],
+                   "stop": st["stop"], "partial_price": st["partial_price"]}
+        self.store.update_trade(t["trade_id"], changes)
+        return {**t, **changes}
+
+    def watch_intraday(self, symbol: str, intra: pd.DataFrame, cost: CostModel, now: pd.Timestamp,
+                       log) -> list[dict]:
+        """v0.13 intraday watch. `intra` = today's finished 15-minute bars. Books stop and
+        target hits within the hour (stop checked first, as in the backtest), and fills
+        pending orders at the session's real open. Trailing stops, breakeven moves and
+        close-based exits still happen once per day at the close, exactly as tested."""
+        closed = []
+        if intra is None or intra.empty:
+            return closed
+        for t in [x for x in self.store.trades() if x["symbol"] == symbol and x["status"] in ("pending", "open")]:
+            last = pd.Timestamp(t["last_bar_time"])
+            session_start = (last + pd.Timedelta(days=1)).normalize()
+            bars = intra[intra.index >= session_start]
+            if bars.empty:
+                continue
+            session_day = bars.index[0].normalize()
+            bars = bars[bars.index.normalize() == session_day]     # one session only
+            entry_session = False
+            if t["status"] == "pending":
+                self._fill(t, float(bars["open"].iloc[0]), session_day, cost, log, " (at the open, intraday)")
+                entry_session = True
+            elif pd.Timestamp(t["opened_at"]).normalize() == session_day:
+                entry_session = True
+            bar = {"open": float(bars["open"].iloc[0]), "high": float(bars["high"].max()),
+                   "low": float(bars["low"].min()), "close": float(bars["close"].iloc[-1])}
+            st = self._state(t)
+            hit = (_entry_bar_exit if entry_session else check_exit)(bar, st["direction"], st["stop"],
+                                                                     st["target"], cost)
+            if hit:
+                result = self._close(t, st, hit[0], hit[1] + " (intraday)", now, cost)
+                closed.append(result)
+                log("auto_trader", f"CLOSED {symbol} {result['exit_reason']} {result['r_multiple']:+.2f}R "
+                    f"(£{result['pnl_gbp']:+.2f})")
+                self.on_close(result)
+        return closed
+
     def process(self, symbol: str, ind: pd.DataFrame, interval: str, cost: CostModel,
                 now: pd.Timestamp, log) -> list[dict]:
         """Fill pending orders and manage open positions bar by bar.
@@ -77,24 +156,7 @@ class PaperBroker:
                                             "missed fill: worker ran too late", "closed_at": str(now)})
                     log("auto_trader", f"{symbol}: cancelled stale pending order", "warning")
                     continue
-                d = int(t["direction"])
-                entry = cost.market_fill(float(first["open"]), d)
-                sig = Signal(d, _f(t["stop_atr"]), _f(t["target_atr"]), int(t["max_hold_bars"]),
-                             stop_swing=bool(_f(t.get("stop_swing"))))
-                sw = t.get("swing_level")
-                sw = None if sw is None or pd.isna(sw) else float(sw)
-                stop, target, rpu = plan_levels(entry, _f(t["atr"]), sig, cost, sw)
-                qty = _f(t["risk_gbp"]) / (rpu * _f(t["fx_to_gbp"], 1.0))  # keep £ risk at plan
-                t.update({"status": "open", "entry_price": entry, "stop": stop, "target": target,
-                          "risk_per_unit": rpu, "quantity": qty, "opened_at": str(fill_bar_time),
-                          "notional_gbp": qty * entry * _f(t["fx_to_gbp"], 1.0), "bars_held": 0,
-                          "best_price": None})
-                self.store.update_trade(t["trade_id"], {k: t[k] for k in (
-                    "status", "entry_price", "stop", "target", "risk_per_unit", "quantity",
-                    "opened_at", "notional_gbp")})
-                log("auto_trader", f"FILLED {symbol} {'LONG' if d > 0 else 'SHORT'} {qty:.4f} @ {entry:.5f} "
-                    f"stop {stop:.5f} [{t['strategy']}]")
-                self.on_open(t)
+                self._fill(t, float(first["open"]), fill_bar_time, cost, log)
             result = self._walk(t, new_bars, cost)
             if result:
                 closed.append(result)
