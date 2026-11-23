@@ -61,7 +61,7 @@ def researched_params(store) -> dict[str, str]:
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
                    regime: str, params: dict[str, str], market_ok: bool | None = None,
                    cost=None, tm_paths: int = 0, cv_cfg: dict | None = None, mgmt: str = "base",
-                   settings=None) -> int:
+                   settings=None, now=None, late_check: str | None = None) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
     from ..backtest import swing_level
@@ -72,6 +72,9 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
 
     row, prev = ind.iloc[-1], ind.iloc[-2]
     bar_time = ind.index[-1]
+    from ..data import signal_is_late
+    if late_check is not None and signal_is_late(bar_time, late_check, symbol, now):
+        return 0          # v0.13.1: never open a practice trade whose entry price is already in the past
     open_keys = {(t["symbol"], t["strategy"].split("(")[0]) for t in view.trades()}
     opened = 0
     for cls_ in ALL_STRATEGIES:
