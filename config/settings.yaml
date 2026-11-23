@@ -157,7 +157,7 @@ confluence:
   min_score: 0
 
 notifications:                   # phone push via ntfy; set the NTFY_TOPIC secret to enable
-  daily_summary_hour_utc: 21
+  daily_summary_hour_utc: 22   # v0.13.1: after the US-close decision run
 
 safety:
   max_consecutive_feed_failures: 3
