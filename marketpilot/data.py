@@ -45,6 +45,29 @@ def interval_td(interval: str) -> timedelta:
     return INTERVALS[interval]
 
 
+SESSION_OPEN = {"us": ("America/New_York", 9, 30), "lse": ("Europe/London", 8, 0)}
+LATE_GRACE_24H = pd.Timedelta(hours=3)   # 24-hour markets: how long after the bar's close a signal stays fresh
+
+
+def signal_is_late(bar_ts: pd.Timestamp, interval: str, symbol: str | None, now) -> bool:
+    """v0.13.1: a signal is only tradable if the entry the backtest assumes (the next
+    session's opening price) is still in the future. Exchange markets: the next
+    weekday's open must not have happened yet. 24-hour markets: the decision must
+    come within a few hours of the bar's close."""
+    now = pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    sess = session_of(symbol) if interval == "1d" else None
+    if sess is None:
+        return now > bar_close_time(bar_ts, interval, symbol) + LATE_GRACE_24H
+    tz, hh, mm = SESSION_OPEN[sess]
+    day = pd.Timestamp(bar_ts).tz_convert("UTC").date() + timedelta(days=1)
+    while day.weekday() >= 5:            # skip the weekend
+        day += timedelta(days=1)
+    nxt = pd.Timestamp(datetime(day.year, day.month, day.day, hh, mm), tz=tz).tz_convert("UTC")
+    return now >= nxt
+
+
 def drop_incomplete(df: pd.DataFrame, interval: str, now: datetime, symbol: str | None = None) -> pd.DataFrame:
     """Remove the in-progress bar so signals never use unfinished data. Daily bars
     of exchange-traded markets count as finished at that exchange's close."""

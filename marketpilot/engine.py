@@ -30,7 +30,7 @@ from .bots.risk import RiskManager
 from .bots.safety import SafetyBot, is_stale
 from .bots.scanner import scan
 from .costs import cost_model_for
-from .data import interval_td, quote_currency
+from .data import interval_td, quote_currency, signal_is_late
 from .indicators import add_indicators
 from .strategies import allows_short, strategy_from_key
 
@@ -217,7 +217,8 @@ class Engine:
                                                                classify_row(ind.iloc[-1]), shadow_params, mf_state,
                                                                cost=cost, tm_paths=self._shadow_tm_paths(),
                                                                cv_cfg=self.s.raw.get("conviction", {}),
-                                                               mgmt=self._mgmt(), settings=self.s)
+                                                               mgmt=self._mgmt(), settings=self.s,
+                                                               now=now_ts, late_check=interval)
 
             if not tradable or symbol not in approved:
                 continue
@@ -241,6 +242,9 @@ class Engine:
                     continue
                 summary["candidates"] += 1
                 news = self.news.check(symbol, cls, now)
+                if signal_is_late(bar_time, interval, symbol, now_ts):
+                    news = news + ["late signal: the next session has already opened, so the entry price "
+                                   "the backtest assumes is gone"]
                 if mf and sig.direction == 1 and symbol not in mf["exclude"] and mf["ok"] is False:
                     news = news + [f"market filter: {mf['symbol']} is below its 200-day average"]
                 if mf and sig.direction == -1 and symbol not in mf["exclude"] and mf["ok"] is True:
