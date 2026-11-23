@@ -270,8 +270,99 @@ class CCUBottom(Strategy):
         return None
 
 
-ALL_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback,
-                                        BollingerReversion, Turtle55, MACDTrend, High52Week, CCUBottom]
+# ---- v0.13: published strategies added to the library -----------------------
+# Each one still has to pass the same walk-forward approval gate before it trades.
+
+class GoldenCross(Strategy):
+    """50/200-day moving-average cross (the "golden cross" / "death cross"), the
+    best-known long-term trend rule in technical-analysis texts. Enter when the
+    50-day average crosses the 200-day; exit on a trailing stop or a close back
+    through the 200-day average."""
+    name, family = "golden_cross", "trend-following"
+    regimes = frozenset({"trending", "ranging", "volatile"})
+    grid = {"stop": [3.0, 4.0], "trail": [0.0, 4.0]}
+
+    def signal(self, prev, row):
+        if _na(row["sma50"], prev["sma50"], row["sma200"], prev["sma200"], row["atr14"]):
+            return None
+        p = self.params
+        if prev["sma50"] <= prev["sma200"] and row["sma50"] > row["sma200"]:
+            return Signal(1, p["stop"], NO_TARGET, 250, "50-day avg crossed above 200-day (golden cross)",
+                          trail_atr=p["trail"], exit_ma=200, exit_on="break")
+        if prev["sma50"] >= prev["sma200"] and row["sma50"] < row["sma200"]:
+            return Signal(-1, p["stop"], NO_TARGET, 250, "50-day avg crossed below 200-day (death cross)",
+                          trail_atr=p["trail"], exit_ma=200, exit_on="break")
+        return None
+
+
+class NR7Breakout(Strategy):
+    """Toby Crabel's NR7 (Day Trading with Short Term Price Patterns and Opening
+    Range Breakout, 1990): after the narrowest-range bar of the last 7, trade the
+    close that breaks out of that bar's range, in the direction of the 50-day trend.
+    Quiet bars tend to come before larger moves."""
+    name, family = "nr7_breakout", "volatility breakout"
+    regimes = frozenset({"trending", "ranging", "volatile"})
+    grid = {"stop": [1.5, 2.5], "target": [3.0, NO_TARGET], "trail": [0.0, 2.5]}
+
+    def signal(self, prev, row):
+        if _na(prev["nr7"], row["sma50"], row["atr14"]):
+            return None
+        p = self.params
+        if p["target"] >= NO_TARGET and p["trail"] == 0:
+            return None
+        if prev["nr7"] < 1:
+            return None
+        if row["close"] > prev["high"] and row["close"] > row["sma50"]:
+            return Signal(1, p["stop"], p["target"], 20, "broke out above an NR7 bar, above 50-day avg",
+                          trail_atr=p["trail"])
+        if row["close"] < prev["low"] and row["close"] < row["sma50"]:
+            return Signal(-1, p["stop"], p["target"], 20, "broke down below an NR7 bar, below 50-day avg",
+                          trail_atr=p["trail"])
+        return None
+
+
+class KeltnerBreakout(Strategy):
+    """Keltner channel breakout (Chester Keltner, 1960, in its modern 20-day EMA
+    +/- 2 ATR form popularised by Linda Raschke): a close outside the channel
+    starts a trend trade; exit on a trailing stop or a close back through the
+    20-day average."""
+    name, family = "keltner_breakout", "trend-following"
+    regimes = frozenset({"trending", "volatile"})
+    grid = {"stop": [2.0, 3.0], "trail": [2.5, 4.0]}
+
+    def signal(self, prev, row):
+        if _na(row["kc_up"], prev["kc_up"], row["atr14"]):
+            return None
+        p = self.params
+        if row["close"] > row["kc_up"] and prev["close"] <= prev["kc_up"]:
+            return Signal(1, p["stop"], NO_TARGET, 60, "close broke above the Keltner channel",
+                          trail_atr=p["trail"], exit_ma=20, exit_on="break")
+        if row["close"] < row["kc_dn"] and prev["close"] >= prev["kc_dn"]:
+            return Signal(-1, p["stop"], NO_TARGET, 60, "close broke below the Keltner channel",
+                          trail_atr=p["trail"], exit_ma=20, exit_on="break")
+        return None
+
+
+LONG_ONLY = {"ccu_3checkmarks"}   # bottom-fishing signals have no short version
+
+
+def _short_version(base: type[Strategy]) -> type[Strategy]:
+    """The same rules, short trades only. Tested and approved separately from the
+    long side, so a strategy's buys are never approved on the strength of its sells
+    (or the other way round)."""
+    def signal(self, prev, row):
+        sig = base.signal(self, prev, row)
+        return sig if sig is not None and sig.direction == -1 else None
+    return type(base.__name__ + "Short", (base,), {
+        "name": base.name + "_short", "family": base.family + " (short)", "short_only": True,
+        "signal": signal, "__doc__": f"Short side only of {base.name}."})
+
+
+LONG_STRATEGIES: list[type[Strategy]] = [TrendSMA200, TrendFollowing, Breakout, MeanReversion, MomentumPullback,
+                                         BollingerReversion, Turtle55, MACDTrend, High52Week, CCUBottom,
+                                         GoldenCross, NR7Breakout, KeltnerBreakout]
+SHORT_STRATEGIES: list[type[Strategy]] = [_short_version(c) for c in LONG_STRATEGIES if c.name not in LONG_ONLY]
+ALL_STRATEGIES: list[type[Strategy]] = LONG_STRATEGIES + SHORT_STRATEGIES
 
 
 def strategy_from_key(key: str) -> Strategy:
@@ -284,6 +375,33 @@ def strategy_from_key(key: str) -> Strategy:
     return cls(**params)
 
 
-# Asset classes where shorting is allowed in the simulation (spot ETFs/crypto
-# with no leverage are long-only; forex pairs are naturally two-way).
+# Asset classes where the ordinary strategies trade both ways (forex pairs are
+# naturally two-way). Other classes are long-only unless listed under
+# `shorting.classes` in settings, in which case the separate "_short" strategies
+# are researched for them (v0.13).
 SHORTABLE = {"forex"}
+
+
+def short_classes(settings) -> set[str]:
+    raw = getattr(settings, "raw", settings) or {}
+    cfg = raw.get("shorting") or {}
+    return set(cfg.get("classes") or []) if cfg.get("enabled", True) else set()
+
+
+def strategies_for(asset_class: str, settings) -> list[type[Strategy]]:
+    """Strategies researched for an asset class: the normal (long, or two-way for
+    forex) set, plus the short-only versions where shorting is switched on."""
+    out = list(LONG_STRATEGIES)
+    if asset_class in short_classes(settings) and asset_class not in SHORTABLE:
+        out += SHORT_STRATEGIES
+    return out
+
+
+def allows_short(asset_class: str, strategy, settings=None) -> bool:
+    """May this strategy open a short in this asset class? Short-only strategies
+    may, where shorting is switched on for the class (`settings` None = assume on)."""
+    if asset_class in SHORTABLE:
+        return True
+    if getattr(strategy, "short_only", False):
+        return settings is None or asset_class in short_classes(settings)
+    return False

@@ -32,7 +32,7 @@ from .bots.scanner import scan
 from .costs import cost_model_for
 from .data import interval_td, quote_currency
 from .indicators import add_indicators
-from .strategies import SHORTABLE, strategy_from_key
+from .strategies import allows_short, strategy_from_key
 
 HISTORY_BARS = 700
 
@@ -103,6 +103,36 @@ class Engine:
             except Exception:
                 pass
 
+    def _watch_cfg(self) -> dict:
+        return self.s.raw.get("intraday_watch") or {}
+
+    def _watch_list(self, symbols, now) -> set[str]:
+        """Markets with an open or pending paper/practice trade get an intraday check.
+        Forex is skipped: its daily bars are stamped differently and nothing trades there."""
+        cfg = self._watch_cfg()
+        if not cfg.get("enabled", False):
+            return set()
+        cls_of = {s: c for s, c, _ in symbols}
+        live = [t for t in self.store.trades() if t["status"] in ("open", "pending")]
+        if self.learning_on:
+            live += [t for t in self.shadow_view.trades() if t["status"] in ("open", "pending")]
+        out = {t["symbol"] for t in live if cls_of.get(t["symbol"]) not in (None, "forex")}
+        if out and hasattr(self.provider, "prefetch"):
+            try:
+                self.provider.prefetch(sorted(out), cfg.get("interval", "15m"), now - timedelta(days=4), now)
+            except Exception:
+                pass
+        return out
+
+    def _intraday(self, symbol: str, now):
+        try:
+            df = self.provider.history(symbol, self._watch_cfg().get("interval", "15m"),
+                                       now - timedelta(days=4), now)
+            return df if df is not None and not df.empty else None
+        except Exception as exc:
+            self.log("monitoring", f"{symbol}: intraday prices unavailable ({type(exc).__name__})", "info")
+            return None
+
     def _symbols(self) -> list[tuple[str, str, bool]]:
         """(symbol, asset_class, tradable). Non-tradable = only managing an old position."""
         out = [(s, self.s.asset_class_of(s), True) for s in self.s.all_symbols()]
@@ -140,6 +170,7 @@ class Engine:
         last_prices: dict[str, float] = {}
         symbols = self._symbols()
         self._prefetch(symbols, now)
+        watch = self._watch_list(symbols, now)
         fx_cache: dict[str, float] = {}
         filters = market_filter_status(self.s, self.provider, now)
         was_killed = self.safety.kill_switch_on()
@@ -170,6 +201,13 @@ class Engine:
 
             closed = self.broker.process(symbol, ind, interval, cost, now_ts, self.log)
             summary["closed"] += len(closed)
+            if symbol in watch:   # v0.13: stop/target hits and fills within the hour
+                intra = self._intraday(symbol, now)
+                if intra is not None:
+                    summary["closed"] += len(self.broker.watch_intraday(symbol, intra, cost, now_ts, self.log))
+                    if self.learning_on:
+                        summary["shadow_closed"] += len(self.shadow.watch_intraday(
+                            symbol, intra, cost, now_ts, lambda *a, **k: None))
 
             if self.learning_on:  # Learning Lab: every strategy, every market, practice ledger
                 summary["shadow_closed"] += len(self.shadow.process(symbol, ind, interval, cost, now_ts,
@@ -179,7 +217,7 @@ class Engine:
                                                                classify_row(ind.iloc[-1]), shadow_params, mf_state,
                                                                cost=cost, tm_paths=self._shadow_tm_paths(),
                                                                cv_cfg=self.s.raw.get("conviction", {}),
-                                                               mgmt=self._mgmt())
+                                                               mgmt=self._mgmt(), settings=self.s)
 
             if not tradable or symbol not in approved:
                 continue
@@ -196,7 +234,7 @@ class Engine:
             for appr in approved[symbol]:
                 strat = strategy_from_key(appr["params"])
                 sig = strat.signal(prev, row)
-                if sig is None or (sig.direction == -1 and cls not in SHORTABLE):
+                if sig is None or (sig.direction == -1 and not allows_short(cls, strat, self.s)):
                     continue
                 cid = f"{symbol}|{strat.key}|{bar_time.isoformat()}"
                 if self.store.candidates_exists(cid):
@@ -205,6 +243,8 @@ class Engine:
                 news = self.news.check(symbol, cls, now)
                 if mf and sig.direction == 1 and symbol not in mf["exclude"] and mf["ok"] is False:
                     news = news + [f"market filter: {mf['symbol']} is below its 200-day average"]
+                if mf and sig.direction == -1 and symbol not in mf["exclude"] and mf["ok"] is True:
+                    news = news + [f"market filter: {mf['symbol']} is above its 200-day average (no shorts)"]
                 live_r = [float(t["r_multiple"]) for t in self.store.trades("closed")
                           if t["symbol"] == symbol and t["strategy"] == strat.key]
                 c_score, c_hits = conf.score(row, sig.direction, None if not mf else mf["ok"])
@@ -220,7 +260,7 @@ class Engine:
                 if tm_cfg.get("enabled", True):
                     try:
                         odds = tm.odds_for(ind, sig, cost, swing_level(row, sig.direction), strat,
-                                           cls in SHORTABLE, n_paths=int(tm_cfg.get("paths", tm.N_PATHS)))
+                                           allows_short(cls, strat, self.s), n_paths=int(tm_cfg.get("paths", tm.N_PATHS)))
                     except Exception as exc:  # odds are information; never let them break trading
                         self.log("time_machine", f"{symbol}: simulation failed ({type(exc).__name__})", "warning")
                 cv_cfg = self.s.raw.get("conviction", {})

@@ -11,19 +11,56 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
-INTERVALS = {"1h": timedelta(hours=1), "4h": timedelta(hours=4), "1d": timedelta(days=1)}
+INTERVALS = {"15m": timedelta(minutes=15), "1h": timedelta(hours=1), "4h": timedelta(hours=4),
+             "1d": timedelta(days=1)}
+
+# v0.13: when is a DAILY bar finished? At its market's close (plus a few minutes
+# for the data to settle), not 24 hours after the bar's date. US-listed ETFs close
+# 16:00 New York, London-listed ETFs 16:30 London. Crypto and forex bars run to
+# midnight UTC, so for them the old rule (bar date + 1 day) still applies.
+SESSION_CLOSE = {"us": ("America/New_York", 16, 15), "lse": ("Europe/London", 16, 45)}
+
+
+def session_of(symbol: str | None) -> str | None:
+    if not symbol or symbol.endswith("=X") or "-USD" in symbol or "/" in symbol:
+        return None          # forex / crypto: 24-hour markets, bar ends at midnight UTC
+    if symbol.endswith(".L"):
+        return "lse"
+    if "." in symbol or symbol.startswith("^"):
+        return None          # other venues / indices: keep the conservative rule
+    return "us"
+
+
+def bar_close_time(bar_ts: pd.Timestamp, interval: str, symbol: str | None = None) -> pd.Timestamp:
+    """UTC time at which the bar stamped `bar_ts` is finished."""
+    sess = session_of(symbol) if interval == "1d" else None
+    if sess is None:
+        return pd.Timestamp(bar_ts) + pd.Timedelta(interval_td(interval))
+    tz, hh, mm = SESSION_CLOSE[sess]
+    day = pd.Timestamp(bar_ts).tz_convert("UTC").date()
+    return pd.Timestamp(datetime(day.year, day.month, day.day, hh, mm), tz=tz).tz_convert("UTC")
 
 
 def interval_td(interval: str) -> timedelta:
     return INTERVALS[interval]
 
 
-def drop_incomplete(df: pd.DataFrame, interval: str, now: datetime) -> pd.DataFrame:
-    """Remove the in-progress bar so signals never use unfinished data."""
+def drop_incomplete(df: pd.DataFrame, interval: str, now: datetime, symbol: str | None = None) -> pd.DataFrame:
+    """Remove the in-progress bar so signals never use unfinished data. Daily bars
+    of exchange-traded markets count as finished at that exchange's close."""
     if df.empty:
         return df
-    cutoff = pd.Timestamp(now) - pd.Timedelta(interval_td(interval))
-    return df[df.index <= cutoff]
+    now = pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    if interval != "1d" or session_of(symbol) is None:
+        cutoff = now - pd.Timedelta(interval_td(interval))
+        return df[df.index <= cutoff]
+    # only the last couple of bars can be unfinished; check those individually
+    keep = np.ones(len(df), dtype=bool)
+    for k in range(max(0, len(df) - 3), len(df)):
+        keep[k] = bar_close_time(df.index[k], interval, symbol) <= now
+    return df[keep]
 
 
 def quote_currency(symbol: str, asset_class: str) -> str:
@@ -76,13 +113,13 @@ class YFinanceProvider(DataProvider):
         self._cache: dict[tuple[str, str], tuple] = {}
 
     @staticmethod
-    def _clean(df: pd.DataFrame, interval: str, end) -> pd.DataFrame:
+    def _clean(df: pd.DataFrame, interval: str, end, symbol: str | None = None) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
         idx = pd.DatetimeIndex(df.index)
         df.index = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
-        return drop_incomplete(df.dropna(), interval, end)
+        return drop_incomplete(df.dropna(), interval, end, symbol)
 
     def prefetch(self, symbols, interval, start, end) -> int:
         """Download many markets in ONE batched request (much faster than one by one).
@@ -103,7 +140,7 @@ class YFinanceProvider(DataProvider):
         got = 0
         for sym in symbols:
             try:
-                df = self._clean(raw[sym].copy(), interval, end)
+                df = self._clean(raw[sym].copy(), interval, end, sym)
             except Exception:
                 continue
             if len(df) > 0:
@@ -124,7 +161,7 @@ class YFinanceProvider(DataProvider):
                          auto_adjust=True, progress=False, threads=False)
         if df is None or df.empty:
             raise RuntimeError(f"no data returned for {symbol}")
-        df = self._clean(df, interval, end)
+        df = self._clean(df, interval, end, symbol)
         self._cache[(symbol, interval)] = (start, end, df)
         return df
 
@@ -144,7 +181,7 @@ class CCXTProvider(DataProvider):
                                    since=int(start.timestamp() * 1000), limit=1000)
         df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
         df.index = pd.to_datetime(df.pop("ts"), unit="ms", utc=True)
-        return drop_incomplete(df, interval, end)
+        return drop_incomplete(df, interval, end, symbol)
 
 
 class SyntheticProvider(DataProvider):

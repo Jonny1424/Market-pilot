@@ -182,14 +182,18 @@ def step_position(st: dict, row, cost: CostModel, entry_bar: bool) -> tuple[floa
 
 
 def trade_r(st: dict, direction: int, entry: float, exit_px: float, rpu: float, cost: CostModel) -> float:
-    """Net R of a closed trade, blending in any partial profit banked earlier."""
+    """Net R of a closed trade, blending in any partial profit banked earlier.
+    Shorts also pay a daily holding cost (borrow / overnight funding, v0.13)."""
     r_exit, _ = realized_r(direction, entry, exit_px, rpu, cost)
+    carry = 0.0
+    if direction == -1 and cost.short_carry_bps_day and rpu:
+        carry = cost.short_carry_bps_day / 10_000 * entry * max(int(st.get("held") or 0), 1) / rpu
     pp = st.get("partial_price")
     if pp is None:
-        return r_exit
+        return r_exit - carry
     f = float((st.get("mgmt") or {}).get("partial_frac", 0.5))
     r_part, _ = realized_r(direction, entry, pp, rpu, cost)
-    return (1 - f) * r_exit + f * r_part
+    return (1 - f) * r_exit + f * r_part - carry
 
 
 def realized_r(direction: int, entry: float, exit_: float, risk_per_unit: float,
@@ -226,7 +230,9 @@ def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_s
                  mgmt: str = "base", compare_modes: tuple[str, ...] = ()) -> list[SimTrade]:
     """Simulate one strategy on one symbol. `ind` must come from add_indicators().
     Only signals with signal_time in [start, end) are taken; one position at a time.
-    `market_ok` (bool series on the same index) blocks LONG entries when False."""
+    `market_ok` (bool series on the same index) blocks LONG entries when False and
+    SHORT entries when True (v0.13: only short a group whose benchmark is below
+    its 200-day average)."""
     idx = ind.index
     n = len(ind)
     rows = ind.to_dict("records")
@@ -240,7 +246,8 @@ def run_backtest(ind: pd.DataFrame, strategy: Strategy, cost: CostModel, allow_s
         sig = strategy.signal(prev, row)
         if (sig is None or (sig.direction == -1 and not allow_short) or not np.isfinite(row["atr14"])
                 or (regime is not None and regime.iloc[i] not in strategy.regimes)
-                or (mk is not None and sig.direction == 1 and not mk[i])):
+                or (mk is not None and sig.direction == 1 and not mk[i])
+                or (mk is not None and sig.direction == -1 and mk[i])):
             i += 1
             continue
         e = i + 1

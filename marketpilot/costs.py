@@ -11,6 +11,7 @@ class CostModel:
     slippage_bps: float = 0.0
     commission_pct: float = 0.0     # % of notional per side
     commission_fixed: float = 0.0   # account currency per side
+    short_carry_bps_day: float = 0.0  # v0.13: daily cost of holding a short (borrow / funding)
 
     @property
     def half_spread(self) -> float:

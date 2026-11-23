@@ -75,4 +75,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["range_lo60"] = out["low"].rolling(60).min()
     out["vol_avg20"] = out["volume"].rolling(20, min_periods=5).mean()
     out["dollar_vol"] = (c * out["volume"]).rolling(20, min_periods=5).mean()
+    # v0.13: Crabel NR7 (today's range is the narrowest of the last 7 bars) and
+    # Keltner channel (20-day EMA +/- 2 ATR)
+    rng = out["high"] - out["low"]
+    out["nr7"] = (rng <= rng.rolling(7, min_periods=7).min()).astype(float)
+    out["kc_up"] = out["ema20"] + 2 * out["atr14"]
+    out["kc_dn"] = out["ema20"] - 2 * out["atr14"]
     return out
