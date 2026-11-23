@@ -5,6 +5,12 @@ A team of trading bots that research strategies, backtest them honestly, then
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
 
+**v0.13.1 — no back-dated fills:** a signal is refused if the next session has already opened by the time
+the bots decide (24-hour markets: more than 3 hours after the bar's close), for paper and practice trades.
+The backtest assumes entry at the next open, so a later decision can't honestly get that price. Found when
+research approved new strategies mid-session and an LQD order filled at Monday's open hours after the open.
+The daily summary now goes out at 22:00 UTC, after the US-close decision run.
+
 **v0.13 — same-evening decisions, live stop checks, the short side and more published strategies:**
 - **Market-close timing.** A daily bar now counts as finished at its market's close: 16:15 New York for
   US-listed ETFs, 16:45 London for London ETFs. Crypto and forex still finish at midnight UTC. Trades are

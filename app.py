@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-VERSION = "v0.13"
+VERSION = "v0.13.1"
 st.set_page_config(page_title=f"MarketPilot {VERSION}", page_icon="📈", layout="wide",
                    initial_sidebar_state="expanded")
 
