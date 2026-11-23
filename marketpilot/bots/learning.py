@@ -19,7 +19,7 @@ from __future__ import annotations
 import pandas as pd
 
 from ..metrics import summarize
-from ..strategies import ALL_STRATEGIES, allows_short
+from ..strategies import ALL_STRATEGIES, allows_short, strategies_for
 
 
 class ShadowView:
@@ -77,7 +77,7 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
         return 0          # v0.13.1: never open a practice trade whose entry price is already in the past
     open_keys = {(t["symbol"], t["strategy"].split("(")[0]) for t in view.trades()}
     opened = 0
-    for cls_ in ALL_STRATEGIES:
+    for cls_ in (strategies_for(cls, settings) if settings is not None else ALL_STRATEGIES):
         key = params.get(f"{symbol}|{cls_.name}")
         strat = strategy_from_key(key) if key else cls_()
         if (symbol, strat.name) in open_keys:
