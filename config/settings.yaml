@@ -43,6 +43,23 @@ universe:
 # Market trend filter (Faber 2007): no new LONG trades in a group while its
 # benchmark closes below its 200-day average. Bonds and commodities have no
 # filter because they often rise when stocks fall.
+# Short side (v0.13). For these groups the "_short" versions of the strategies are
+# researched and, if they pass the same approval gate, may open short paper trades.
+# Shorts are only allowed while the group's benchmark (market_filter) is BELOW its
+# 200-day average. Crypto is left out: crypto derivatives can't be sold to UK
+# retail clients, so a crypto short could not be placed for real.
+# A short pays short_carry_bps_day (in `costs`) for every day it is held.
+shorting:
+  enabled: true
+  classes: [stocks, international, bonds, commodities]
+
+# Intraday watch (v0.13): every hourly run checks open paper trades against
+# today's 15-minute prices, so stop and target hits are booked within the hour
+# instead of the next day. Pending orders fill at the session's real open.
+intraday_watch:
+  enabled: true
+  interval: 15m
+
 market_filter:
   stocks: {symbol: SPY}
   international: {symbol: EFA}
@@ -51,10 +68,10 @@ market_filter:
 # Transaction cost model per asset class (applied in backtests AND paper fills).
 # bps = basis points (1 bp = 0.01%). Commission is per side.
 costs:
-  stocks: {spread_bps: 2.0, slippage_bps: 3.0, commission_pct: 0.0, commission_fixed: 0.0}
-  international: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0}
-  bonds:  {spread_bps: 2.0, slippage_bps: 2.0, commission_pct: 0.0, commission_fixed: 0.0}
-  commodities: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0}
+  stocks: {spread_bps: 2.0, slippage_bps: 3.0, commission_pct: 0.0, commission_fixed: 0.0, short_carry_bps_day: 1.5}
+  international: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0, short_carry_bps_day: 1.5}
+  bonds:  {spread_bps: 2.0, slippage_bps: 2.0, commission_pct: 0.0, commission_fixed: 0.0, short_carry_bps_day: 1.5}
+  commodities: {spread_bps: 4.0, slippage_bps: 4.0, commission_pct: 0.0, commission_fixed: 0.0, short_carry_bps_day: 1.5}
   # crypto: entry-tier taker fee on Kraken Pro is 0.40%, Coinbase Advanced 0.60%
   crypto: {spread_bps: 10.0, slippage_bps: 10.0, commission_pct: 0.40, commission_fixed: 0.0}
   forex:  {spread_bps: 2.0, slippage_bps: 1.0, commission_pct: 0.0, commission_fixed: 0.0}   # crosses are wider than majors
@@ -95,7 +112,7 @@ goals:
 #   partial   = bank half at +1R, then move the rest's stop to breakeven (Peter Brandt style)
 # Research tests all three on the same trades every Saturday; the winner is set here.
 trade_management:
-  mode: base
+  mode: breakeven              # v0.13: stop moves to entry (+ costs) once a bar closes +1R in profit
   compare: [base, breakeven, partial]
 
 # Loss Control (v0.11): size every new trade down when big or clustered losses are more likely.
