@@ -843,3 +843,92 @@ def test_yfinance_batch_prefetch_and_cache(monkeypatch):
     assert len(calls) == 2 and (b["close"] == 2.0).all()
     p.history("BBB", "1d", start, end)                           # now cached
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------- v0.13 ----
+
+def test_daily_bar_finishes_at_its_market_close():
+    from marketpilot.data import drop_incomplete
+    idx = pd.date_range("2026-11-20", periods=2, freq="D", tz="UTC").append(
+        pd.DatetimeIndex([pd.Timestamp("2026-11-23", tz="UTC")]))   # Fri, Sat(placeholder), Mon
+    df = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}, index=idx)
+    before = datetime(2026, 11, 23, 20, 0, tzinfo=timezone.utc)      # 15:00 New York, Monday
+    after = datetime(2026, 11, 23, 21, 30, tzinfo=timezone.utc)      # 16:30 New York, Monday
+    assert drop_incomplete(df, "1d", before, "SPY").index[-1] < pd.Timestamp("2026-11-23", tz="UTC")
+    assert drop_incomplete(df, "1d", after, "SPY").index[-1] == pd.Timestamp("2026-11-23", tz="UTC")
+    # London ETF finishes at 16:45 London (= UTC in winter)
+    assert drop_incomplete(df, "1d", datetime(2026, 11, 23, 16, 50, tzinfo=timezone.utc),
+                           "ISF.L").index[-1] == pd.Timestamp("2026-11-23", tz="UTC")
+    # crypto keeps the midnight-UTC rule
+    assert drop_incomplete(df, "1d", after, "BTC-USD").index[-1] < pd.Timestamp("2026-11-23", tz="UTC")
+
+
+def test_short_versions_only_short_and_respect_settings(settings):
+    from marketpilot.strategies import SHORT_STRATEGIES, allows_short, strategies_for
+    names = {c.name for c in SHORT_STRATEGIES}
+    assert "turtle_55_short" in names and "ccu_3checkmarks_short" not in names
+    stocks = {c.name for c in strategies_for("stocks", settings)}
+    assert "turtle_55_short" in stocks and "turtle_55" in stocks
+    assert "turtle_55_short" not in {c.name for c in strategies_for("crypto", settings)}
+    assert "turtle_55_short" not in {c.name for c in strategies_for("forex", settings)}
+    short = next(c for c in SHORT_STRATEGIES if c.name == "turtle_55_short")()
+    assert allows_short("stocks", short, settings) and not allows_short("crypto", short, settings)
+    assert strategy_from_key(short.key).name == "turtle_55_short"
+    ind = add_indicators(_walk(drift=-0.002, seed=4))
+    trades = run_backtest(ind, short, _ZERO, True)
+    assert trades and all(t.direction == -1 for t in trades)
+
+
+def test_market_filter_blocks_shorts_while_benchmark_is_rising():
+    from marketpilot.strategies import SHORT_STRATEGIES
+    short = next(c for c in SHORT_STRATEGIES if c.name == "breakout_donchian_short")()
+    ind = add_indicators(_walk(drift=-0.001, seed=5))
+    rising = pd.Series(True, index=ind.index)
+    falling = pd.Series(False, index=ind.index)
+    assert run_backtest(ind, short, _ZERO, True, market_ok=rising) == []
+    assert run_backtest(ind, short, _ZERO, True, market_ok=falling)
+
+
+def test_shorts_pay_a_daily_holding_cost():
+    from marketpilot.backtest import trade_r
+    cost = CostModel(short_carry_bps_day=10.0)       # 0.1% a day
+    st = {"held": 10, "partial_price": None}
+    r_short = trade_r(st, -1, 100.0, 98.0, 2.0, cost)  # +1R before carry
+    assert r_short == pytest.approx(1.0 - 0.001 * 100 * 10 / 2.0)
+    assert trade_r(st, 1, 100.0, 102.0, 2.0, cost) == pytest.approx(1.0)   # longs unaffected
+
+
+def test_intraday_watch_fills_at_open_and_books_stop_within_the_hour(store):
+    pb = PaperBroker(store)
+    day = pd.Timestamp("2026-11-23", tz="UTC")
+    sig = Signal(1, 1.0, NO_TARGET, 50, "t")
+    pb.submit(candidate_id="c1", symbol="XYZ", asset_class="stocks", strategy_key="s", signal=sig,
+              regime="trending", bar_time=day - pd.Timedelta(days=3), atr=2.0, qty=1.0, risk_gbp=2.0,
+              risk_per_unit=2.0, fx=1.0, notional=100.0, cost_r=0.0)
+    intra = pd.DataFrame({"open": [100.0, 100.4], "high": [100.6, 100.5], "low": [99.9, 97.5],
+                          "close": [100.4, 97.8], "volume": 1.0},
+                         index=pd.DatetimeIndex([day + pd.Timedelta(hours=14, minutes=30),
+                                                 day + pd.Timedelta(hours=14, minutes=45)]))
+    closed = pb.watch_intraday("XYZ", intra.iloc[:1], _ZERO, day + pd.Timedelta(hours=15), lambda *a, **k: None)
+    t = store.trades()[0]
+    assert not closed and t["status"] == "open" and t["entry_price"] == pytest.approx(100.0)
+    assert t["stop"] == pytest.approx(98.0)
+    closed = pb.watch_intraday("XYZ", intra, _ZERO, day + pd.Timedelta(hours=15, minutes=7), lambda *a, **k: None)
+    assert len(closed) == 1 and closed[0]["exit_reason"] == "stop (intraday)"
+    assert closed[0]["r_multiple"] == pytest.approx(-1.0)
+    # the daily close later on must not re-process a trade the watch already closed
+    daily = pd.DataFrame([_bar(100.0, 100.6, 97.5, 97.8)], index=pd.DatetimeIndex([day]))
+    assert pb.process("XYZ", daily, "1d", _ZERO, day + pd.Timedelta(hours=22), lambda *a, **k: None) == []
+
+
+def test_published_strategies_signal_on_their_rules():
+    from marketpilot.strategies import GoldenCross, KeltnerBreakout, NR7Breakout
+    prev = {"sma50": 99.0, "sma200": 100.0, "atr14": 1.0}
+    row = {"sma50": 101.0, "sma200": 100.0, "atr14": 1.0}
+    assert GoldenCross().signal(prev, row).direction == 1
+    prev = {"nr7": 1.0, "high": 101.0, "low": 99.0, "close": 100.0}
+    row = {"close": 102.0, "sma50": 95.0, "atr14": 1.0}
+    assert NR7Breakout(stop=1.5, target=3.0, trail=0.0).signal(prev, row).direction == 1
+    prev = {"close": 104.0, "kc_up": 105.0, "kc_dn": 95.0}
+    row = {"close": 106.0, "kc_up": 105.5, "kc_dn": 95.5, "atr14": 1.0}
+    assert KeltnerBreakout().signal(prev, row).direction == 1
