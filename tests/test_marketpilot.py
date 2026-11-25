@@ -945,3 +945,54 @@ def test_late_signals_are_refused():
     sun = pd.Timestamp("2026-11-22", tz="UTC")
     assert not signal_is_late(sun, "1d", "BTC-USD", datetime(2026, 11, 23, 1, 7, tzinfo=UTC))
     assert signal_is_late(sun, "1d", "BTC-USD", datetime(2026, 11, 23, 18, 48, tzinfo=UTC))
+
+
+# ---------------------------------------------------------------- v0.14 ----
+
+def test_daily_scan_merges_dedupes_and_summarises(store):
+    from marketpilot.bots import daily_scan
+    it = {"bar": "2026-11-25T00:00:00+00:00", "symbol": "LQD", "asset_class": "bonds", "strategy": "nr7_breakout",
+          "side": "LONG", "grade": "C", "confluence": 4, "p_target": 0.4, "status": "traded", "why": "all checks passed"}
+    sk = {**it, "symbol": "SPY", "asset_class": "stocks", "status": "skipped", "why": "market filter: SPY below"}
+    pr = {**it, "symbol": "GLD", "strategy": "golden_cross", "status": "practice"}
+    assert daily_scan.merge(store, [it, sk, pr]) == 3
+    assert daily_scan.merge(store, [it]) == 0                 # same setup seen again next hour
+    day, items = daily_scan.latest(store)
+    assert day == "2026-11-25" and len(items) == 3
+    txt = daily_scan.summary_text(day, items)
+    assert "3 setups" in txt and "traded 1" in txt and "TRADED LQD" in txt and "skipped SPY" in txt
+
+
+def test_new_strategies_need_t3_then_probation_then_promotion(store, settings):
+    from marketpilot.bots.learning import is_new_strategy, pipeline_cfg, probation_verdict
+    cfg = pipeline_cfg(settings)
+    assert is_new_strategy("nr7_breakout", cfg) and is_new_strategy("turtle_55_short", cfg)
+    assert not is_new_strategy("turtle_55", cfg)
+    now = pd.Timestamp("2026-12-30", tz="UTC")
+    stats = pd.DataFrame([{"asset_class": "bonds", "strategy": "nr7_breakout", "trades": 25,
+                           "expectancy_r": 0.12, "profit_factor": 1.3, "t_stat": 1.0, "win_rate": 0.5}])
+    early = {("bonds", "nr7_breakout"): pd.Timestamp("2026-12-20", tz="UTC")}
+    ready = {("bonds", "nr7_breakout"): pd.Timestamp("2026-11-26", tz="UTC")}
+    assert probation_verdict(stats, early, "bonds", "nr7_breakout", cfg, now) == (None, "")   # under 4 weeks
+    verdict, why = probation_verdict(stats, ready, "bonds", "nr7_breakout", cfg, now)
+    assert verdict == "promote" and why.startswith("promoted after probation")
+    bad = stats.assign(expectancy_r=-0.2)
+    assert probation_verdict(bad, ready, "bonds", "nr7_breakout", cfg, now)[0] == "fail"
+
+
+def test_research_puts_new_strategies_on_probation(store, settings):
+    from marketpilot.bots.research import research
+    from marketpilot.data import SyntheticProvider
+    gate = {"min_oos_trades": 1, "min_oos_expectancy_r": -9.0, "min_oos_profit_factor": 0.0,
+            "min_oos_tstat": None, "min_holdout_trades": 0, "min_holdout_expectancy_r": -9.0}
+    saved = settings.raw.get("pipeline")
+    settings.raw["pipeline"] = {**(saved or {}), "new_min_tstat": -99.0}
+    try:
+        rows = research(settings, SyntheticProvider(), store, datetime(2026, 6, 1, tzinfo=UTC),
+                        symbols=["SPY"], gate_override=gate, log=lambda *a: None)
+    finally:
+        settings.raw["pipeline"] = saved
+    st_by = {r["strategy"]: r["status"] for r in rows}
+    assert st_by.get("turtle_55") == "approved"
+    assert st_by.get("keltner_breakout") == "probation"
+    assert st_by.get("turtle_55_short") == "probation"
