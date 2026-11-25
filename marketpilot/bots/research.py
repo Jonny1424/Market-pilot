@@ -19,6 +19,7 @@ from ..costs import cost_model_for
 from ..metrics import summarize
 from ..storage import now_iso
 from ..strategies import allows_short, strategies_for
+from .learning import PROMOTED, is_new_strategy, pipeline_cfg
 from .learning import forward_stats, forward_verdict
 from .losscontrol import compare as lc_compare
 from .losscontrol import config as lc_config
@@ -40,6 +41,9 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
     mgmt = tm_cfg.get("mode", "base")
     compare_modes = tuple(tm_cfg.get("compare", ["base", "breakeven", "partial"]))
     fstats = forward_stats(store) if learn_cfg else None
+    pipe = pipeline_cfg(settings)
+    earned = {(x["asset_class"], x["strategy"]) for x in store.strategies("approved")
+              if any(str(r).startswith(PROMOTED) for r in (x.get("reasons") or []))}
     rows_out = []
     for cls_name, spec in settings["universe"].items():
         data = {}
@@ -87,15 +91,23 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
             lc = lc_compare(sorted(oos_all, key=lambda t: t.entry_time), lc_cfg)
             hold_all = [t for r in per_symbol.values() for t in r["holdout_trades"]]
             mg = management_breakdown(sorted(oos_all, key=lambda t: t.entry_time), hold_all, compare_modes)
-            ok, reasons = passes_gate(pooled, gate)
+            new = is_new_strategy(strat.name, pipe)
+            gate_s = {**gate, "min_oos_tstat": max(gate.get("min_oos_tstat") or 0, pipe["new_min_tstat"])} \
+                if new else gate
+            ok, reasons = passes_gate(pooled, gate_s)
             if learn_cfg:  # forward (shadow) evidence can promote or demote
                 verdict, why = forward_verdict(fstats, cls_name, strat.name, learn_cfg)
                 if verdict == "promote" and not ok and pooled["oos"]["expectancy_r"] > 0:
                     ok, reasons = True, [why]
                 elif verdict == "demote" and ok:
                     ok, reasons = False, [why]
+            status = "approved" if ok else "rejected"
+            if ok and new and (cls_name, strat.name) not in earned:
+                status = "probation"
+                reasons = [f"passed the backtest gate (new strategy, t-stat >= {pipe['new_min_tstat']}); on "
+                           f"probation until it proves itself in the Learning lab"]
             o = pooled["oos"]
-            log(f"research: {cls_name:<7} {strat.name:<20} {'APPROVED' if ok else 'rejected':<9} "
+            log(f"research: {cls_name:<7} {strat.name:<20} {status.upper() if ok else 'rejected':<9} "
                 f"OOS n={o['trades']:<4} win {o['win_rate']:.0%} exp {o['expectancy_r']:+.3f}R "
                 f"PF {o['profit_factor']:.2f} t {o['t_stat']:.1f} | holdout n={pooled['holdout']['trades']} "
                 f"exp {pooled['holdout']['expectancy_r']:+.3f}R" + ("" if ok else f"  — {reasons[0]}"))
@@ -114,7 +126,7 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                     continue
                 row = {"strategy_id": sid, "symbol": symbol, "asset_class": cls_name,
                        "strategy": strat.name, "family": strat.family, "params": r["final_params"],
-                       "status": "approved" if ok else "rejected", "reasons": reasons,
+                       "status": status, "reasons": reasons,
                        "oos": {**pooled["oos"], "symbol_trades": r["oos"]["trades"],
                                "symbol_expectancy_r": r["oos"]["expectancy_r"], "by_confluence": by_conf,
                                "loss_control": lc, "management": mg, "mgmt_mode": mgmt},
@@ -124,7 +136,9 @@ def research(settings, provider, store, now: datetime, symbols: list[str] | None
                 store.save_strategy(row)
                 rows_out.append(row)
     n_ok = len({(r["asset_class"], r["strategy"]) for r in rows_out if r["status"] == "approved"})
-    store.log("strategy_research", f"research complete: {n_ok} strategy/market combinations approved")
+    n_prob = len({(r["asset_class"], r["strategy"]) for r in rows_out if r["status"] == "probation"})
+    store.log("strategy_research", f"research complete: {n_ok} strategy/market combinations approved, "
+                                   f"{n_prob} on probation")
     try:
         store.prune(int((settings.raw.get("storage") or {}).get("keep_log_days", 60)))
     except Exception:

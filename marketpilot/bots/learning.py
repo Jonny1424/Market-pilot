@@ -61,7 +61,8 @@ def researched_params(store) -> dict[str, str]:
 def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.DataFrame,
                    regime: str, params: dict[str, str], market_ok: bool | None = None,
                    cost=None, tm_paths: int = 0, cv_cfg: dict | None = None, mgmt: str = "base",
-                   settings=None, now=None, late_check: str | None = None) -> int:
+                   settings=None, now=None, late_check: str | None = None,
+                   found: list | None = None) -> int:
     """Open a shadow trade for every strategy that signals on the latest bar and
     has no open shadow position on this symbol. Returns the number opened."""
     from ..backtest import swing_level
@@ -100,7 +101,70 @@ def shadow_signals(view: ShadowView, broker, symbol: str, cls: str, ind: pd.Data
             extra={**tm.trade_fields(odds), "grade": (g := cv.grade(cs[0], odds, cv_cfg)), "mgmt": mgmt},
             extra_note=cv.describe(g, cs[0], odds) + (f" | {odds.describe()}" if odds else ""))
         opened += int(bool(ok))
+        if ok and found is not None:   # v0.14 daily scan
+            found.append({"bar": bar_time.isoformat(), "symbol": symbol, "asset_class": cls,
+                          "strategy": strat.name, "side": "LONG" if sig.direction > 0 else "SHORT",
+                          "grade": g, "confluence": cs[0], "p_target": None if odds is None else odds.p_target,
+                          "status": "practice", "why": "practice trade in the Learning lab"})
     return opened
+
+
+PROMOTED = "promoted"   # reasons starting with this mark a strategy that earned approval live
+
+PIPELINE_DEFAULTS = {"enabled": True, "new_families": [], "new_min_tstat": 3.0, "probation_min_trades": 20,
+                     "probation_min_days": 28, "probation_min_expectancy_r": 0.0, "probation_min_pf": 1.0,
+                     "probation_fail_below_r": -0.10}
+
+
+def pipeline_cfg(settings) -> dict:
+    raw = getattr(settings, "raw", settings) or {}
+    return {**PIPELINE_DEFAULTS, **(raw.get("pipeline") or {})}
+
+
+def is_new_strategy(name: str, cfg: dict) -> bool:
+    """New strategies go through the v0.14 pipeline: higher backtest bar, then probation."""
+    if not cfg.get("enabled", True):
+        return False
+    base = name[:-6] if name.endswith("_short") else name
+    return name.endswith("_short") or base in set(cfg.get("new_families") or [])
+
+
+def practice_start(store) -> dict[tuple, pd.Timestamp]:
+    """First practice trade date per (asset_class, strategy family), from all shadow trades."""
+    out: dict[tuple, pd.Timestamp] = {}
+    for t in store.shadow_trades():
+        if t.get("status") == "cancelled" or not t.get("opened_at"):
+            continue
+        k = (t["asset_class"], str(t["strategy"]).split("(")[0])
+        ts = pd.Timestamp(t["opened_at"])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        if k not in out or ts < out[k]:
+            out[k] = ts
+    return out
+
+
+def probation_verdict(stats: pd.DataFrame, starts: dict, cls: str, strategy: str, cfg: dict,
+                      now: pd.Timestamp) -> tuple[str | None, str]:
+    """('promote' | 'fail' | None, reason) for a strategy on probation."""
+    if stats is None or stats.empty:
+        return None, ""
+    m = stats[(stats["asset_class"] == cls) & (stats["strategy"] == strategy)]
+    if m.empty:
+        return None, ""
+    r = m.iloc[0]
+    n, exp_r, pf = int(r["trades"]), float(r["expectancy_r"]), float(r.get("profit_factor", 0) or 0)
+    if n < cfg["probation_min_trades"]:
+        return None, ""
+    if exp_r < cfg["probation_fail_below_r"]:
+        return "fail", f"failed probation: {n} practice trades averaging {exp_r:+.3f}R"
+    start = starts.get((cls, strategy))
+    days = (now - start).days if start is not None else 0
+    if days >= cfg["probation_min_days"] and exp_r >= cfg["probation_min_expectancy_r"] \
+            and pf >= cfg["probation_min_pf"]:
+        return "promote", (f"{PROMOTED} after probation: {n} practice trades over {days} days, "
+                           f"{exp_r:+.3f}R per trade, profit factor {pf:.2f}")
+    return None, ""
 
 
 def forward_stats(store) -> pd.DataFrame:
@@ -143,7 +207,7 @@ def forward_verdict(stats: pd.DataFrame, cls: str, strategy: str, cfg: dict) -> 
     r = m.iloc[0]
     if (r["trades"] >= cfg["promote_min_trades"] and r["expectancy_r"] >= cfg["promote_min_expectancy_r"]
             and r["t_stat"] >= cfg["promote_min_tstat"]):
-        return "promote", (f"promoted by forward test: {int(r['trades'])} shadow trades, "
+        return "promote", (f"{PROMOTED} by forward test: {int(r['trades'])} shadow trades, "
                            f"{r['expectancy_r']:+.3f}R, t {r['t_stat']:.1f}, win {r['win_rate']:.0%}")
     if r["trades"] >= cfg["demote_min_trades"] and r["expectancy_r"] < cfg["demote_below_expectancy_r"]:
         return "demote", (f"demoted by forward test: {int(r['trades'])} shadow trades, "
@@ -158,8 +222,18 @@ def apply_learning(store, settings, log=lambda *a: None) -> list[str]:
     if stats.empty:
         return []
     msgs: dict[tuple, str] = {}
+    pipe = pipeline_cfg(settings)
+    starts = practice_start(store) if any(s["status"] == "probation" for s in store.strategies()) else {}
+    now = pd.Timestamp.now(tz="UTC")
     for s in store.strategies():
         if s["status"] in ("retired", "removed"):
+            continue
+        if s["status"] == "probation":
+            pv, why = probation_verdict(stats, starts, s["asset_class"], s["strategy"], pipe, now)
+            if pv:
+                store.save_strategy({**s, "status": "approved" if pv == "promote" else "rejected",
+                                     "reasons": [why]})
+                msgs[(s["asset_class"], s["strategy"])] = f"{s['asset_class']} {s['strategy']}: {why}"
             continue
         verdict, why = forward_verdict(stats, s["asset_class"], s["strategy"], cfg)
         oos = s.get("oos") or {}
