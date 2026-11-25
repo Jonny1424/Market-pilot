@@ -1,9 +1,25 @@
-# MarketPilot v0.13 — Multi-Agent AI Paper Trading
+# MarketPilot v0.14 — Multi-Agent AI Paper Trading
 
 A team of trading bots that research strategies, backtest them honestly, then
 **automatically open and close paper trades** across US stock-market, bond and gold
 ETFs, crypto and forex — logging every decision, win and loss, with push
 notifications to your phone.
+
+**v0.14 — daily scan and a new-strategy pipeline:**
+- **Daily scan.** Every hourly run records each setup it finds across all markets and strategies:
+  - **Traded**, or **skipped** with the reason (market filter, risk limits, late signal and so on), for
+    approved strategies.
+  - **Practice** trades in the Learning lab.
+  - The log keeps 10 days (`scan_log` in mp_control). A new **Daily scan** dashboard page shows it, and the
+    evening phone summary includes a scan section.
+- **New-strategy pipeline** (`pipeline`). Strategy families added after the original set, and every short-only
+  version, must clear three stages before placing paper trades:
+  1. The backtest gate with t-stat ≥ 3. With many ideas tried, a newly found edge needs t > 3 to be believable
+     (Harvey, Liu & Zhu, 2016).
+  2. Probation in the Learning lab: at least 4 weeks and 20 closed practice trades.
+  3. Promotion if practice expectancy ≥ 0R and profit factor ≥ 1.0 after costs; rejection below −0.10R.
+- To add a new idea: code it in `strategies.py`, add its name to `pipeline.new_families`, and research does the
+  rest.
 
 **v0.13.1 — no back-dated fills:** a signal is refused if the next session has already opened by the time
 the bots decide (24-hour markets: more than 3 hours after the bar's close), for paper and practice trades.

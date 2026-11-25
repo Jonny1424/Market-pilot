@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-VERSION = "v0.13.1"
+VERSION = "v0.14"
 st.set_page_config(page_title=f"MarketPilot {VERSION}", page_icon="📈", layout="wide",
                    initial_sidebar_state="expanded")
 
@@ -198,9 +198,9 @@ open_pos = [t for t in trades if t["status"] in ("open", "pending")]
 ALL_SYMBOLS = {s: cls for cls, u in settings["universe"].items() for s in u["symbols"]}
 
 # ---------------- sidebar navigation ----------------
-PAGES = ["Dashboard", "Markets", "Trade planner", "Positions", "Trade history", "Bot decisions", "Strategies",
-         "Learning lab", "Bot activity", "Learn", "Settings"]
-ICONS = {"Dashboard": "space_dashboard", "Markets": "candlestick_chart", "Trade planner": "model_training",
+PAGES = ["Dashboard", "Daily scan", "Markets", "Trade planner", "Positions", "Trade history", "Bot decisions",
+         "Strategies", "Learning lab", "Bot activity", "Learn", "Settings"]
+ICONS = {"Dashboard": "space_dashboard", "Daily scan": "radar", "Markets": "candlestick_chart", "Trade planner": "model_training",
          "Positions": "account_balance_wallet", "Trade history": "receipt_long", "Bot decisions": "rule",
          "Strategies": "science", "Learning lab": "psychology", "Bot activity": "monitor_heart",
          "Learn": "school", "Settings": "tune"}
@@ -613,6 +613,41 @@ elif page == "Bot decisions":
                      column_config={"expected_r": st.column_config.NumberColumn("EV (R)", format="%+.3f"),
                                     "odds": st.column_config.NumberColumn("Target first", format="percent")})
 
+# ================= Daily scan =================
+elif page == "Daily scan":
+    st.caption("Every setup the bots found on each day's finished bars, across all markets and every strategy: "
+               "approved strategies (traded or skipped, with the reason) and practice trades in the Learning lab.")
+    try:
+        scan_log = json.loads(q("get_control", "scan_log", "") or "{}")
+    except Exception:
+        scan_log = {}
+    if not scan_log:
+        st.info("The first scan appears after the next hourly run.")
+    else:
+        days = sorted(scan_log, reverse=True)
+        day = st.selectbox("Bar date", days, index=0)
+        sdf = pd.DataFrame(scan_log.get(day, []))
+        if sdf.empty:
+            st.info("No setups on this date.")
+        else:
+            n = lambda k: int((sdf["status"] == k).sum())
+            cards([("Setups", f"{len(sdf)}", f"on {sdf['symbol'].nunique()} markets", "muted"),
+                   ("Traded", f"{n('traded')}", "paper account", "up" if n("traded") else "muted"),
+                   ("Skipped", f"{n('skipped')}", "approved but blocked", "muted"),
+                   ("Practising", f"{n('practice')}", "Learning lab", "muted")])
+            show = st.segmented_control("Show", ["all", "traded", "skipped", "practice"], default="all")
+            if show and show != "all":
+                sdf = sdf[sdf["status"] == show]
+            order = {"traded": 0, "skipped": 1, "practice": 2}
+            sdf = sdf.assign(_o=sdf["status"].map(order)).sort_values(["_o", "asset_class", "symbol"])
+            st.dataframe(sdf[["status", "symbol", "asset_class", "side", "strategy", "grade", "confluence",
+                              "p_target", "why"]], hide_index=True, width="stretch",
+                         column_config={"p_target": st.column_config.NumberColumn("Target first", format="percent"),
+                                        "confluence": st.column_config.NumberColumn("Confluence", format="%d/8")})
+            st.caption("Skipped = an approved strategy signalled but a safety check said no (market filter, risk "
+                       "limits, late signal...). Practice = recorded by the Learning lab only; it never risks the "
+                       "paper account.")
+
 # ================= Strategies =================
 elif page == "Strategies":
     st.caption("Tested walk-forward on unseen data with fees, spreads and slippage, pooled per market group, "
@@ -632,8 +667,12 @@ elif page == "Strategies":
         g["max_dd"] = g["oos"].apply(lambda x: x.get("max_drawdown_r"))
         g["dd_cut"] = g["oos"].apply(lambda x: (x.get("loss_control") or {}).get("dd_cut_pct"))
         n_app = int((g["status"] == "approved").sum())
+        n_prob = int((g["status"] == "probation").sum())
         cards([("Approved", f"{n_app}", f"of {len(g)} tested", "up"),
-               ("Rejected", f"{len(g) - n_app}", "failed a gate", "muted")])
+               ("On probation", f"{n_prob}", "new: proving itself in the Learning lab", "muted"),
+               ("Rejected", f"{len(g) - n_app - n_prob}", "failed a gate", "muted")])
+        st.caption("New strategies need a t-stat of 3+ on past data, then at least 4 weeks and 20 practice trades "
+                   "in the Learning lab with a positive result before they may place paper trades.")
         st.dataframe(g.sort_values(["status", "t"], ascending=[True, False])[
             ["asset_class", "strategy", "status", "trades", "expectancy", "pf", "max_dd", "dd_cut", "win_rate", "t",
              "holdout", "why"]],
