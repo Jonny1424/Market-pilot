@@ -43,6 +43,27 @@ universe:
 # Market trend filter (Faber 2007): no new LONG trades in a group while its
 # benchmark closes below its 200-day average. Bonds and commodities have no
 # filter because they often rise when stocks fall.
+# New-strategy pipeline (v0.14). A strategy family added to the library after the
+# original set must clear three stages before it may place paper trades:
+#   1. backtest gate with a HIGHER bar: t-stat >= new_min_tstat (Harvey, Liu & Zhu
+#      2016: with hundreds of ideas tried, a newly found edge needs t > 3 to be
+#      believable), plus every other gate as usual;
+#   2. probation: it practises in the Learning lab on live prices for at least
+#      probation_min_days and probation_min_trades closed practice trades;
+#   3. promotion to approved if practice expectancy (after costs) is at least
+#      probation_min_expectancy_r and profit factor at least probation_min_pf;
+#      rejected if it falls below probation_fail_below_r.
+# All short-only versions ("_short") count as new.
+pipeline:
+  enabled: true
+  new_families: [golden_cross, nr7_breakout, keltner_breakout]
+  new_min_tstat: 3.0
+  probation_min_trades: 20
+  probation_min_days: 28
+  probation_min_expectancy_r: 0.0
+  probation_min_pf: 1.0
+  probation_fail_below_r: -0.10
+
 # Short side (v0.13). For these groups the "_short" versions of the strategies are
 # researched and, if they pass the same approval gate, may open short paper trades.
 # Shorts are only allowed while the group's benchmark (market_filter) is BELOW its
