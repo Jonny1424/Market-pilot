@@ -19,6 +19,7 @@ from .backtest import plan_levels, swing_level
 from .bots import confluence as conf
 from .bots.autotrader import PaperBroker, mark_to_market
 from .bots.decision import DecisionBot
+from .bots import daily_scan
 from .bots.learning import ShadowView, apply_learning, researched_params, shadow_signals
 from .bots.news import NewsBot
 from .bots import conviction as cv
@@ -164,6 +165,7 @@ class Engine:
         if self.learning_on:
             self.shadow_view.refresh()
             shadow_params = researched_params(self.store)
+        self._scan: list[dict] = []          # v0.14 daily scan: every setup found this cycle
         approved = {}
         for a in self.store.strategies("approved"):
             approved.setdefault(a["symbol"], []).append(a)
@@ -218,7 +220,8 @@ class Engine:
                                                                cost=cost, tm_paths=self._shadow_tm_paths(),
                                                                cv_cfg=self.s.raw.get("conviction", {}),
                                                                mgmt=self._mgmt(), settings=self.s,
-                                                               now=now_ts, late_check=interval)
+                                                               now=now_ts, late_check=interval,
+                                                               found=self._scan)
 
             if not tradable or symbol not in approved:
                 continue
@@ -303,6 +306,12 @@ class Engine:
                     "asset_class": cls, "strategy": strat.key, "direction": sig.direction,
                     "regime": regime, "price": float(row["close"]), "decision": "trade" if go else "reject",
                     "expected_r": dec.expected_r, "reasons": reasons, "evidence": evidence})
+                self._scan.append({"bar": bar_time.isoformat(), "symbol": symbol, "asset_class": cls,
+                                   "strategy": strat.name, "side": "LONG" if sig.direction > 0 else "SHORT",
+                                   "grade": c_grade, "confluence": c_score,
+                                   "p_target": None if odds is None else odds.p_target,
+                                   "status": "traded" if go else "skipped",
+                                   "why": "all checks passed" if go else ("; ".join(reasons) or "rejected")})
                 if go:
                     self.broker.submit(candidate_id=cid, symbol=symbol, asset_class=cls,
                                        strategy_key=strat.key, signal=sig, regime=regime, bar_time=bar_time,
@@ -349,6 +358,10 @@ class Engine:
                          f"closed {summary['shadow_closed']}")
         if not was_killed and self.safety.kill_switch_on():
             notify.kill_switch(self.store.get_control("pause_reason", "") or "safety rule triggered")
+        try:
+            daily_scan.merge(self.store, self._scan)
+        except Exception as exc:
+            self.log("monitoring", f"daily scan save failed ({type(exc).__name__})", "warning")
         self._daily_summary(now_ts, trades, eq, n_open)
         summary["equity"] = eq
         self.log("worker", f"cycle done: {len(symbols)} markets, {summary['candidates']} signals, "
@@ -445,7 +458,9 @@ class Engine:
         today = now_ts.strftime("%Y-%m-%d")
         if now_ts.hour >= hour and self.store.get_control("summary_sent", "") != today:
             rep = report(trades, self.s.account["starting_balance"])
-            notify.daily_summary(rep["overall"], eq, n_open, self.s["goals"]["target_win_rate"])
+            day, items = daily_scan.latest(self.store)
+            notify.daily_summary(rep["overall"], eq, n_open, self.s["goals"]["target_win_rate"],
+                                 scan_text=daily_scan.summary_text(day, items))
             self.store.set_control("summary_sent", today)
 
 
